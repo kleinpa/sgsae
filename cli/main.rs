@@ -1,19 +1,14 @@
 extern crate sgsae;
 
-fn addw(rs1: sgsae::Register, rs2: sgsae::Register, rd: sgsae::Register) -> sgsae::Instruction {
-    sgsae::Instruction::ADDW {
-        rs2: rs2,
-        rs1: rs1,
-        rd: rd,
-    }
-}
+use sgsae::instructions::Instruction;
+use sgsae::machine::Machine;
 
-// 12345678 90123456 78901234 56789012
-// [0b00000000, 0b00010000, 0b00000000, 0b00111011]
 fn main() {
-    let bytes = addw(0, 1, 0).encode().to_be_bytes();
-
-    let mut m = sgsae::Machine::new();
-    m.test_init(&[bytes, bytes, bytes].concat());
-    m.run();
+    #[rustfmt::skip]
+    Machine::new_with_instructions(&[
+        Instruction::ADDW {rd: 1, rs1: 1, rs2: 2},
+        Instruction::ADDIW { rd: 1, rs: 1, imm: 88},
+        Instruction::EBREAK{},
+    ])
+    .run();
 }

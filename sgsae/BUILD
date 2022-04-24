@@ -1,12 +1,20 @@
-package(default_visibility = ["//visibility:public"])
-
-load("@rules_rust//rust:defs.bzl", "rust_doc", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_doc", "rust_library", "rust_test")
 
 rust_library(
     name = "sgsae",
     srcs = [
-        "sgsae.rs",
+        "instructions.rs",
+        "lib.rs",
+        "machine.rs",
+        "types.rs",
     ],
+    crate_name = "sgsae",
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "sgsae_test",
+    crate = ":sgsae",
 )
 
 rust_doc(

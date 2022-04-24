@@ -1,0 +1,14 @@
+[package]
+name = "sgsae"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "sgsae"
+path = "sgsae/lib.rs"
+
+[[bin]]
+name = "cli"
+path = "cli/main.rs"
+
+[dependencies]
