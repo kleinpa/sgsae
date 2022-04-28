@@ -280,41 +280,47 @@ pub enum Instruction {
     /// Add Upper Immediate to PC
     AUIPC { rd: Register, offset: u32 },
     /// Jump and Link
-    JAL { rd: Register, offset: u32 },
+    JAL { rd: Register, offset: i32 },
     /// Jump and Link Register
-    JALR { rd: Register, rs: Register, offset: u16 },
+    JALR { rd: Register, rs: Register, offset: i16 },
     /// Branch Equal
-    BEQ { rs1: Register, rs2: Register, offset: u16 },
+    BEQ { rs1: Register, rs2: Register, offset: i16 },
     /// Branch Not Equal
-    BNE { rs1: Register, rs2: Register, offset: u16 },
+    BNE { rs1: Register, rs2: Register, offset: i16 },
     /// Branch Less Than
-    BLT { rs1: Register, rs2: Register, offset: u16 },
+    BLT { rs1: Register, rs2: Register, offset: i16 },
     /// Branch Greater than Equal
-    BGE { rs1: Register, rs2: Register, offset: u16 },
+    BGE { rs1: Register, rs2: Register, offset: i16 },
     /// Branch Less Than Unsigned
-    BLTU { rs1: Register, rs2: Register, offset: u16 },
+    BLTU { rs1: Register, rs2: Register, offset: i16 },
     /// Branch Greater than Equal Unsigned
-    BGEU { rs1: Register, rs2: Register, offset: u16 },
+    BGEU { rs1: Register, rs2: Register, offset: i16 },
     /// Load Byte
-    LB { rs: Register, rd: Register, offset: u16 },
+    LB { rs: Register, rd: Register, offset: i16 },
     /// Load Half
-    LH { rs: Register, rd: Register, offset: u16 },
+    LH { rs: Register, rd: Register, offset: i16 },
     /// Load Word
-    LW { rs: Register, rd: Register, offset: u16 },
+    LW { rs: Register, rd: Register, offset: i16 },
+    /// Load Double
+    LD { rs: Register, rd: Register, offset: i16 },
+    /// Load Word Unsigned
+    LWU { rs: Register, rd: Register, offset: i16 },
     /// Load Byte Unsigned
-    LBU { rs: Register, rd: Register, offset: u16 },
+    LBU { rs: Register, rd: Register, offset: i16 },
     /// Load Half Unsigned
-    LHU { rs: Register, rd: Register, offset: u16 },
+    LHU { rs: Register, rd: Register, offset: i16 },
     /// Store Byte
-    SB { rs1: Register, rs2: Register, offset: u16 },
+    SB { rs1: Register, rs2: Register, offset: i16 },
     /// Store Half
-    SH { rs1: Register, rs2: Register, offset: u16 },
+    SH { rs1: Register, rs2: Register, offset: i16 },
     /// Store Word
-    SW { rs1: Register, rs2: Register, offset: u16 },
+    SW { rs1: Register, rs2: Register, offset: i16 },
+    /// Store Double
+    SD { rs1: Register, rs2: Register, offset: i16 },
     /// Add Immediate
-    ADDI { rd: Register, rs: Register, imm: u16 },
+    ADDI { rd: Register, rs: Register, imm: i16 },
     /// Set Less Than Immediate
-    SLTI { rd: Register, rs: Register, imm: u16 },
+    SLTI { rd: Register, rs: Register, imm: i16 },
     /// Set Less Than Immediate Unsigned
     SLTIU { rd: Register, rs: Register, imm: u16 },
     /// Xor Immediate
@@ -329,6 +335,8 @@ pub enum Instruction {
     SRLI { rd: Register, rs: Register, imm: u8 },
     /// Shift Right Arithmetic Immediate
     SRAI { rd: Register, rs: Register, imm: u8 },
+    /// Add Immediate Word
+    ADDIW { rd: Register, rs: Register, imm: i16 },
     /// Add
     ADD { rd: Register, rs1: Register, rs2: Register },
     /// Subtract
@@ -349,14 +357,6 @@ pub enum Instruction {
     OR { rd: Register, rs1: Register, rs2: Register },
     /// And
     AND { rd: Register, rs1: Register, rs2: Register },
-    /// Load Word Unsigned
-    LWU { rs: Register, rd: Register, offset: u16 },
-    /// Load Double
-    LD { rs: Register, rd: Register, offset: u16 },
-    /// Store Double
-    SD { rs1: Register, rs2: Register, offset: u16 },
-    /// Add Immediate Word
-    ADDIW { rd: Register, rs: Register, imm: u16 },
     /// Shift Left Logical Immediate Word
     SLLIW { rd: Register, rs: Register, imm: u8 },
     /// Shift Right Logical Immediate Word
@@ -388,36 +388,50 @@ pub enum Instruction {
     /// CSR Read and Clear Bits
     CSRRC { rs:  Register, rd: Register, csr: u16 },
     /// CSR Read and Write bits Immediate
-    CSRRWI { zimm: u16, rd: Register, csr: u16 },
+    CSRRWI { zimm: u8, rd: Register, csr: u16 },
     /// CSR Read and Set bits Immediate
-    CSRRSI { zimm: u16, rd: Register, csr: u16 },
+    CSRRSI { zimm: u8, rd: Register, csr: u16 },
     /// CSR Read and Clear Immediate
-    CSRRCI { zimm: u16, rd: Register, csr: u16 },
+    CSRRCI { zimm: u8, rd: Register, csr: u16 },
 
     UNKNOWN { instruction: u32 },
 }
 
 #[rustfmt::skip]
 impl Instruction {
+
+    /// Decode a binary instruction into a struct. Sign extend to native type where appropriate.
     pub fn decode(x: u32) -> Instruction {
+        /// Sign extend 11-bit int to i16
+        fn se11(x: u16) -> i16 {
+            (x.wrapping_shl(5) as i16).wrapping_shr(5)
+        }
+        /// Sign extend 12-bit int to i16
+        fn se12(x: u16) -> i16 {
+            (x.wrapping_shl(4) as i16).wrapping_shr(4)
+        }
+        /// Sign extend 20-bit int to i32
+        fn se20(x: u32) -> i32 {
+            (x.wrapping_shl(12) as i32).wrapping_shr(12)
+        }
         match get_opcode(x) {
             0b0000011 => match IType::decode(x) {
-                code::IType { funct3: 0b000, rd, rs, imm } => Instruction::LB { rd: rd, rs: rs, offset: imm },
-                code::IType { funct3: 0b001, rd, rs, imm } => Instruction::LH { rd: rd, rs: rs, offset: imm },
-                code::IType { funct3: 0b010, rd, rs, imm } => Instruction::LW { rd: rd, rs: rs, offset: imm },
-                code::IType { funct3: 0b011, rd, rs, imm } => Instruction::LD { rd: rd, rs: rs, offset: imm },
-                code::IType { funct3: 0b100, rd, rs, imm } => Instruction::LBU { rd: rd, rs: rs, offset: imm },
-                code::IType { funct3: 0b101, rd, rs, imm } => Instruction::LHU { rd: rd, rs: rs, offset: imm },
-                code::IType { funct3: 0b110, rd, rs, imm } => Instruction::LWU { rd: rd, rs: rs, offset: imm },
+                code::IType { funct3: 0b000, rd, rs, imm } => Instruction::LB { rd: rd, rs: rs, offset: se12(imm) },
+                code::IType { funct3: 0b001, rd, rs, imm } => Instruction::LH { rd: rd, rs: rs, offset: se12(imm) },
+                code::IType { funct3: 0b010, rd, rs, imm } => Instruction::LW { rd: rd, rs: rs, offset: se12(imm) },
+                code::IType { funct3: 0b011, rd, rs, imm } => Instruction::LD { rd: rd, rs: rs, offset: se12(imm) },
+                code::IType { funct3: 0b100, rd, rs, imm } => Instruction::LBU { rd: rd, rs: rs, offset: se12(imm) },
+                code::IType { funct3: 0b101, rd, rs, imm } => Instruction::LHU { rd: rd, rs: rs, offset: se12(imm) },
+                code::IType { funct3: 0b110, rd, rs, imm } => Instruction::LWU { rd: rd, rs: rs, offset: se12(imm) },
                 _ => Instruction::UNKNOWN { instruction: x },
             },
             0b0010011 => match IType::decode(x) {
-                code::IType { funct3: 0b000, rd, rs, imm } => Instruction::ADDI { rd: rd, rs: rs, imm: imm },
+                code::IType { funct3: 0b000, rd, rs, imm } => Instruction::ADDI { rd: rd, rs: rs, imm: se11(imm) },
                 code::IType { funct3: 0b001, .. } => match IshType::decode(x) {
                     code::IshType { ish: 0b0000000, rd, rs, shamt, .. } => Instruction::SLLI { rd: rd, rs: rs, imm: shamt },
                     _  => Instruction::UNKNOWN { instruction: x },
                 }
-                code::IType { funct3: 0b010, rd, rs, imm } => Instruction::SLTI { rd: rd, rs: rs, imm: imm },
+                code::IType { funct3: 0b010, rd, rs, imm } => Instruction::SLTI { rd: rd, rs: rs, imm: se11(imm) },
                 code::IType { funct3: 0b011, rd, rs, imm } => Instruction::SLTIU { rd: rd, rs: rs, imm: imm },
                 code::IType { funct3: 0b100, rd, rs, imm } => Instruction::XORI { rd: rd, rs: rs, imm: imm },
                 code::IType { funct3: 0b101, .. } => match IshType::decode(x) {
@@ -430,7 +444,7 @@ impl Instruction {
                 _  => Instruction::UNKNOWN { instruction: x },
             },
             0b0011011 => match IType::decode(x) {
-                code::IType { funct3: 0b000, rd, rs, imm } => Instruction::ADDIW { imm: imm, rs: rs, rd: rd },
+                code::IType { funct3: 0b000, rd, rs, imm } => Instruction::ADDIW { imm: se11(imm), rs: rs, rd: rd },
                 code::IType { funct3: 0b001, .. } => match IshType::decode(x) {
                      code::IshType { ish: 0b0000000, shamt, rs, rd, .. } => Instruction::SLLIW { imm: shamt, rs: rs, rd: rd }, // assert shamt[5]==0
                      _  => Instruction::UNKNOWN { instruction: x },
@@ -443,7 +457,7 @@ impl Instruction {
                 _  => Instruction::UNKNOWN { instruction: x },
             },
             0b1100111 => match IType::decode(x) {
-                code::IType { funct3: 0b000, rd, rs, imm } => Instruction::JALR  { rd: rd, rs: rs, offset: imm },
+                code::IType { funct3: 0b000, rd, rs, imm } => Instruction::JALR  { rd: rd, rs: rs, offset: se11(imm) },
                  _  => Instruction::UNKNOWN { instruction: x },
             },
             0b0110011 => match RType::decode(x) {
@@ -468,19 +482,19 @@ impl Instruction {
                 _ => Instruction::UNKNOWN { instruction: x },
             },
             0b0100011 => match SType::decode(x) {
-                code::SType { funct3: 0b000, rs1, rs2, imm } => Instruction::SB { rs1: rs1, rs2: rs2, offset: imm },
-                code::SType { funct3: 0b001, rs1, rs2, imm } => Instruction::SH { rs1: rs1, rs2: rs2, offset: imm },
-                code::SType { funct3: 0b010, rs1, rs2, imm } => Instruction::SW { rs1: rs1, rs2: rs2, offset: imm },
-                code::SType { funct3: 0b011, rs1, rs2, imm } => Instruction::SD { rs1: rs1, rs2: rs2, offset: imm },
+                code::SType { funct3: 0b000, rs1, rs2, imm } => Instruction::SB { rs1: rs1, rs2: rs2, offset: se12(imm) },
+                code::SType { funct3: 0b001, rs1, rs2, imm } => Instruction::SH { rs1: rs1, rs2: rs2, offset: se12(imm) },
+                code::SType { funct3: 0b010, rs1, rs2, imm } => Instruction::SW { rs1: rs1, rs2: rs2, offset: se12(imm) },
+                code::SType { funct3: 0b011, rs1, rs2, imm } => Instruction::SD { rs1: rs1, rs2: rs2, offset: se12(imm) },
                 _ => Instruction::UNKNOWN { instruction: x },
             },
             0b1100011 => match SBType::decode(x) {
-                code::SBType { funct3: 0b000, rs1, rs2, imm } => Instruction::BEQ { rs1: rs1, rs2: rs2, offset: imm },
-                code::SBType { funct3: 0b001, rs1, rs2, imm } => Instruction::BNE { rs1: rs1, rs2: rs2, offset: imm },
-                code::SBType { funct3: 0b100, rs1, rs2, imm } => Instruction::BLT { rs1: rs1, rs2: rs2, offset: imm },
-                code::SBType { funct3: 0b101, rs1, rs2, imm } => Instruction::BGE { rs1: rs1, rs2: rs2, offset: imm },
-                code::SBType { funct3: 0b110, rs1, rs2, imm } => Instruction::BLTU { rs1: rs1, rs2: rs2, offset: imm },
-                code::SBType { funct3: 0b111, rs1, rs2, imm } => Instruction::BGEU { rs1: rs1, rs2: rs2, offset: imm },
+                code::SBType { funct3: 0b000, rs1, rs2, imm } => Instruction::BEQ { rs1: rs1, rs2: rs2, offset: se12(imm) },
+                code::SBType { funct3: 0b001, rs1, rs2, imm } => Instruction::BNE { rs1: rs1, rs2: rs2, offset: se12(imm) },
+                code::SBType { funct3: 0b100, rs1, rs2, imm } => Instruction::BLT { rs1: rs1, rs2: rs2, offset: se12(imm) },
+                code::SBType { funct3: 0b101, rs1, rs2, imm } => Instruction::BGE { rs1: rs1, rs2: rs2, offset: se12(imm) },
+                code::SBType { funct3: 0b110, rs1, rs2, imm } => Instruction::BLTU { rs1: rs1, rs2: rs2, offset: se12(imm) },
+                code::SBType { funct3: 0b111, rs1, rs2, imm } => Instruction::BGEU { rs1: rs1, rs2: rs2, offset: se12(imm) },
                 _ => Instruction::UNKNOWN { instruction: x },
             },
             0b0010111 => match UType::decode(x) {
@@ -490,7 +504,7 @@ impl Instruction {
                 code::UType { rd, imm } => Instruction::LUI { rd: rd, imm: imm },
             }
             0b1101111 => match UJType::decode(x) {
-                code::UJType {rd, offset} => Instruction::JAL { rd: rd, offset: offset },
+                code::UJType {rd, offset} => Instruction::JAL { rd: rd, offset: se20(offset) },
             }
             0b0001111 => match FenceType::decode(x) {
                 code::FenceType {funct3: 0b000, pred, succ } => Instruction::FENCE { pred: pred, succ: succ},
@@ -503,9 +517,9 @@ impl Instruction {
                 code::IType { funct3: 0b001, rd, rs, imm } => Instruction::CSRRW { rd: rd, rs: rs, csr: imm },
                 code::IType { funct3: 0b010, rd, rs, imm } => Instruction::CSRRS { rd: rd, rs: rs, csr: imm },
                 code::IType { funct3: 0b011, rd, rs, imm } => Instruction::CSRRC { rd: rd, rs: rs, csr: imm },
-                code::IType { funct3: 0b101, rd, rs, imm } => Instruction::CSRRWI { rd: rd, zimm: rs as u16, csr: imm },
-                code::IType { funct3: 0b110, rd, rs, imm } => Instruction::CSRRSI { rd: rd, zimm: rs as u16, csr: imm },
-                code::IType { funct3: 0b111, rd, rs, imm } => Instruction::CSRRCI { rd: rd, zimm: rs as u16, csr: imm },
+                code::IType { funct3: 0b101, rd, rs, imm } => Instruction::CSRRWI { rd: rd, zimm: rs, csr: imm },
+                code::IType { funct3: 0b110, rd, rs, imm } => Instruction::CSRRSI { rd: rd, zimm: rs, csr: imm },
+                code::IType { funct3: 0b111, rd, rs, imm } => Instruction::CSRRCI { rd: rd, zimm: rs, csr: imm },
                 _ => Instruction::UNKNOWN { instruction: x },
             },
             _ => Instruction::UNKNOWN { instruction: x },
@@ -514,27 +528,27 @@ impl Instruction {
 
     pub fn encode(&self) -> u32 {
         match self {
-            Instruction::LB { rd, offset, rs } => IType::encode(0b0000011, 0b000, *rd, *rs, *offset),
-            Instruction::LH { rd, offset, rs } => IType::encode(0b0000011, 0b001, *rd, *rs, *offset),
-            Instruction::LW { rd, offset, rs } => IType::encode(0b0000011, 0b010, *rd, *rs, *offset),
-            Instruction::LD { rd, offset, rs } => IType::encode(0b0000011, 0b011, *rd, *rs, *offset),
-            Instruction::LBU { rd, offset, rs } => IType::encode(0b0000011, 0b100, *rd, *rs, *offset),
-            Instruction::LHU { rd, offset, rs } => IType::encode(0b0000011, 0b101, *rd, *rs, *offset),
-            Instruction::LWU { rd, offset, rs } => IType::encode(0b0000011, 0b110, *rd, *rs, *offset),
-            Instruction::ADDI { rd, rs, imm } => IType::encode(0b0010011, 0b000, *rd, *rs, *imm),
+            Instruction::LB { rd, offset, rs } => IType::encode(0b0000011, 0b000, *rd, *rs, *offset as u16),
+            Instruction::LH { rd, offset, rs } => IType::encode(0b0000011, 0b001, *rd, *rs, *offset as u16),
+            Instruction::LW { rd, offset, rs } => IType::encode(0b0000011, 0b010, *rd, *rs, *offset as u16),
+            Instruction::LD { rd, offset, rs } => IType::encode(0b0000011, 0b011, *rd, *rs, *offset as u16),
+            Instruction::LBU { rd, offset, rs } => IType::encode(0b0000011, 0b100, *rd, *rs, *offset as u16),
+            Instruction::LHU { rd, offset, rs } => IType::encode(0b0000011, 0b101, *rd, *rs, *offset as u16),
+            Instruction::LWU { rd, offset, rs } => IType::encode(0b0000011, 0b110, *rd, *rs, *offset as u16),
+            Instruction::ADDI { rd, rs, imm } => IType::encode(0b0010011, 0b000, *rd, *rs, *imm as u16),
             Instruction::SLLI { rd, rs, imm } => IshType::encode(0b0010011, 0b001, *rd, *rs, *imm, 0),
-            Instruction::SLTI { rd, rs, imm } => IType::encode(0b0010011, 0b010, *rd, *rs, *imm),
+            Instruction::SLTI { rd, rs, imm } => IType::encode(0b0010011, 0b010, *rd, *rs, *imm as u16),
             Instruction::SLTIU { rd, rs, imm } => IType::encode(0b0010011, 0b011, *rd, *rs, *imm),
             Instruction::XORI { rd, rs, imm } => IType::encode(0b0010011, 0b100, *rd, *rs, *imm),
             Instruction::SRLI { rd, rs, imm } => IshType::encode(0b0010011, 0b101, *rd, *rs, *imm, 0),
             Instruction::SRAI { rd, rs, imm } => IshType::encode(0b0010011, 0b101, *rd, *rs, *imm, 0b0100000),
             Instruction::ORI { rd, rs, imm } => IType::encode(0b0010011, 0b110, *rd, *rs, *imm),
             Instruction::ANDI { rd, rs, imm } => IType::encode(0b0010011, 0b111, *rd, *rs, *imm),
-            Instruction::ADDIW { rd, rs, imm } => IType::encode(0b0011011, 0b000, *rd, *rs, *imm),
+            Instruction::ADDIW { rd, rs, imm } => IType::encode(0b0011011, 0b000, *rd, *rs, *imm as u16),
             Instruction::SLLIW { rd, rs, imm } => IshType::encode(0b0011011, 0b001, *rd, *rs, *imm, 0),
             Instruction::SRLIW { rd, rs, imm } => IshType::encode(0b0011011, 0b101, *rd, *rs, *imm, 0),
             Instruction::SRAIW { rd, rs, imm } => IshType::encode(0b0011011, 0b101, *rd, *rs, *imm, 0b0100000),
-            Instruction::JALR { rd, rs, offset } => IType::encode(0b1100111, 0b000, *rd, *rs, *offset),
+            Instruction::JALR { rd, rs, offset } => IType::encode(0b1100111, 0b000, *rd, *rs, *offset as u16),
             Instruction::ADD { rd, rs1, rs2 } => RType::encode(0b0110011, 0b000, 0b0000000, *rd, *rs1, *rs2),
             Instruction::SUB { rd, rs1, rs2 } => RType::encode(0b0110011, 0b000, 0b0100000, *rd, *rs1, *rs2),
             Instruction::SLL { rd, rs1, rs2 } => RType::encode(0b0110011, 0b001, 0b0000000, *rd, *rs1, *rs2),
@@ -550,19 +564,19 @@ impl Instruction {
             Instruction::SLLW { rd, rs1, rs2 } => RType::encode(0b0111011, 0b001, 0b0000000, *rd, *rs1, *rs2),
             Instruction::SRLW { rd, rs1, rs2 } => RType::encode(0b0111011, 0b101, 0b0000000, *rd, *rs1, *rs2),
             Instruction::SRAW { rd, rs1, rs2 } => RType::encode(0b0111011, 0b101, 0b0100000, *rd, *rs1, *rs2),
-            Instruction::SB { rs2, offset, rs1 } => SType::encode(0b0100011, 0b000, *rs1, *rs2, *offset),
-            Instruction::SH { offset, rs1, rs2 } => SType::encode(0b0100011, 0b001, *rs1, *rs2, *offset),
-            Instruction::SW { offset, rs1, rs2 } => SType::encode(0b0100011, 0b010, *rs1, *rs2, *offset),
-            Instruction::SD { offset, rs1, rs2 } => SType::encode(0b0100011, 0b011, *rs1, *rs2, *offset),
-            Instruction::BEQ { rs1, rs2, offset } => SBType::encode(0b1100011, 0b000, *rs1, *rs2, *offset),
-            Instruction::BNE { rs1, rs2, offset } => SBType::encode(0b1100011, 0b001, *rs1, *rs2, *offset),
-            Instruction::BLT { rs1, rs2, offset } => SBType::encode(0b1100011, 0b100, *rs1, *rs2, *offset),
-            Instruction::BGE { rs1, rs2, offset } => SBType::encode(0b1100011, 0b101, *rs1, *rs2, *offset),
-            Instruction::BLTU { rs1, rs2, offset } => SBType::encode(0b1100011, 0b110, *rs1, *rs2, *offset),
-            Instruction::BGEU { rs1, rs2, offset } => SBType::encode(0b1100011, 0b111, *rs1, *rs2, *offset),
+            Instruction::SB { rs2, offset, rs1 } => SType::encode(0b0100011, 0b000, *rs1, *rs2, *offset as u16),
+            Instruction::SH { offset, rs1, rs2 } => SType::encode(0b0100011, 0b001, *rs1, *rs2, *offset as u16),
+            Instruction::SW { offset, rs1, rs2 } => SType::encode(0b0100011, 0b010, *rs1, *rs2, *offset as u16),
+            Instruction::SD { offset, rs1, rs2 } => SType::encode(0b0100011, 0b011, *rs1, *rs2, *offset as u16),
+            Instruction::BEQ { rs1, rs2, offset } => SBType::encode(0b1100011, 0b000, *rs1, *rs2, *offset as u16),
+            Instruction::BNE { rs1, rs2, offset } => SBType::encode(0b1100011, 0b001, *rs1, *rs2, *offset as u16),
+            Instruction::BLT { rs1, rs2, offset } => SBType::encode(0b1100011, 0b100, *rs1, *rs2, *offset as u16),
+            Instruction::BGE { rs1, rs2, offset } => SBType::encode(0b1100011, 0b101, *rs1, *rs2, *offset as u16),
+            Instruction::BLTU { rs1, rs2, offset } => SBType::encode(0b1100011, 0b110, *rs1, *rs2, *offset as u16),
+            Instruction::BGEU { rs1, rs2, offset } => SBType::encode(0b1100011, 0b111, *rs1, *rs2, *offset as u16),
             Instruction::AUIPC { rd, offset } => UType::encode(0b0010111, *rd, *offset),
             Instruction::LUI { rd, imm } => UType::encode(0b0110111, *rd, *imm),
-            Instruction::JAL { rd, offset } => UJType::encode(0b1101111, *rd, *offset),
+            Instruction::JAL { rd, offset } => UJType::encode(0b1101111, *rd, *offset as u32),
             Instruction::FENCE { pred, succ } => FenceType::encode(0b0001111, 0b000, *pred, *succ),
             Instruction::FENCEI {} => IType::encode(0b0001111, 0b001,0,0,0),
             Instruction::ECALL {} => IType::encode(0b1110011, 0b000,0,0,0),
@@ -570,9 +584,9 @@ impl Instruction {
             Instruction::CSRRW { rs, rd, csr } => IType::encode(0b1110011, 0b001, *rd, *rs, *csr),
             Instruction::CSRRS { rs, rd, csr } => IType::encode(0b1110011, 0b010, *rd, *rs, *csr),
             Instruction::CSRRC { rs, rd, csr } => IType::encode(0b1110011, 0b011, *rd, *rs, *csr),
-            Instruction::CSRRWI { zimm, rd, csr } => IType::encode(0b1110011, 0b101, *rd, *zimm as usize, *csr),
-            Instruction::CSRRSI { zimm, rd, csr } => IType::encode(0b1110011, 0b110, *rd, *zimm as usize, *csr),
-            Instruction::CSRRCI { zimm, rd, csr } => IType::encode(0b1110011, 0b111, *rd, *zimm as usize, *csr),
+            Instruction::CSRRWI { zimm, rd, csr } => IType::encode(0b1110011, 0b101, *rd, *zimm, *csr),
+            Instruction::CSRRSI { zimm, rd, csr } => IType::encode(0b1110011, 0b110, *rd, *zimm, *csr),
+            Instruction::CSRRCI { zimm, rd, csr } => IType::encode(0b1110011, 0b111, *rd, *zimm, *csr),
             Instruction::UNKNOWN { instruction } => *instruction,
         }
     }
