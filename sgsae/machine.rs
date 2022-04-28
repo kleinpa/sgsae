@@ -1,89 +1,967 @@
 use crate::instructions::Instruction;
-use crate::types::ProgramCounter;
+use crate::types::{Memory, ProgramCounter};
+
+struct ArrayMemory<const N: usize> {
+    memory: [u8; N],
+}
+impl<const N: usize> ArrayMemory<N> {
+    fn new() -> ArrayMemory<N> {
+        return ArrayMemory { memory: [0; N] };
+    }
+    fn new_with_memory(memory: [u8; N]) -> ArrayMemory<N> {
+        return ArrayMemory { memory: memory };
+    }
+}
+impl<const N: usize> Memory for ArrayMemory<N> {
+    fn load(&self, a: crate::types::Address) -> u8 {
+        return self.memory[a];
+    }
+
+    fn store(&mut self, a: crate::types::Address, x: u8) {
+        self.memory[a] = x;
+    }
+}
 
 pub struct Machine {
     program_counter: ProgramCounter,
     registers: [u64; 32],
-    memory: [u8; 65536],
+    memory: ArrayMemory<65536>,
+    done: Option<u64>,
 }
 
 impl Machine {
     pub fn new() -> Machine {
+        Machine { program_counter: 0, registers: [0; 32], memory: ArrayMemory::new(), done: None }
+    }
+    pub fn new_with_memory(memory: [u8; 65536]) -> Machine {
         Machine {
             program_counter: 0,
             registers: [0; 32],
-            memory: [0; 65536],
+            memory: ArrayMemory::new_with_memory(memory),
+            done: None,
         }
     }
 
     // Constructor for tests and experiments. The provided instructions will be copied into memory and executed.
     pub fn new_with_instructions(instructions: &[Instruction]) -> Machine {
         let mut m = Machine::new();
-        let mut i = 0; // current address
+        let mut i = 0; // start address
 
         for instruction in instructions {
             let bytes = instruction.encode().to_le_bytes();
-            m.memory[i..i + 4].copy_from_slice(&bytes);
-            i += bytes.len();
+            for x in bytes {
+                m.memory.store(i, x);
+                i = i + 1;
+            }
         }
         return m;
     }
 
-    //
-    /// ```
-    /// let x = 5;
-    /// ```
-    pub fn run(&mut self) {
+    pub fn run(&mut self) -> u64 {
         loop {
-            // fetch
-            let data = u32::from_le_bytes([
-                self.memory[(self.program_counter) + 0],
-                self.memory[(self.program_counter) + 1],
-                self.memory[(self.program_counter) + 2],
-                self.memory[(self.program_counter) + 3],
-            ]);
+            let instruction = self.fetch();
 
-            self.program_counter += 4;
+            self.execute(instruction);
 
-            // decode
-            let instruction = Instruction::decode(data);
-            println!("{:?}", instruction);
-
-            // execute
-            match instruction {
-                Instruction::ADDW { rs1, rs2, rd } => {
-                    self.registers[rd] = self.registers[rs1] + self.registers[rs2];
-                }
-                Instruction::ADDIW { imm, rs, rd } => {
-                    self.registers[rd] = self.registers[rs] + imm as u64
-                }
-                Instruction::EBREAK {} => return,
-                _ => {
-                    panic!("unknown instruction");
-                }
+            if let Some(i) = self.done {
+                return i;
             }
-
-            println!("{:?}", self.registers);
         }
     }
 
-    pub fn init(&mut self, data: &[u8]) {
-        self.memory[..data.len()].copy_from_slice(data);
-        self.registers[1] = 1; // remove once addi implemented
+    fn fetch(&mut self) -> Instruction {
+        let data = u32::from_le_bytes([
+            self.memory.load((self.program_counter) + 0),
+            self.memory.load((self.program_counter) + 1),
+            self.memory.load((self.program_counter) + 2),
+            self.memory.load((self.program_counter) + 3),
+        ]);
+        self.program_counter += 4;
+        return Instruction::decode(data);
+    }
+
+    fn execute(&mut self, instruction: Instruction) {
+        // execute
+        #[allow(unused_variables)]
+        match instruction {
+            Instruction::LB { rs, rd, offset } => {
+                let a = self.registers[rs] as usize + (offset as usize);
+                self.registers[rd] = i8::from_le_bytes(self.memory.load_array(a)) as u32 as u64;
+                // rd ← s8[rs1 + offset]
+            }
+            Instruction::LH { rs, rd, offset } => {
+                let a = self.registers[rs] as usize + (offset as usize);
+                self.registers[rd] = i16::from_le_bytes(self.memory.load_array(a)) as u32 as u64;
+                // rd ← s16[rs1 + offset]
+            }
+            Instruction::LW { rs, rd, offset } => {
+                let a = self.registers[rs] as usize + (offset as usize);
+                self.registers[rd] = i32::from_le_bytes(self.memory.load_array(a)) as u64;
+                // rd ← s32[rs1 + offset]
+            }
+            Instruction::LD { rs, rd, offset } => {
+                let a = self.registers[rs] as usize + (offset as usize);
+                self.registers[rd] = i64::from_le_bytes(self.memory.load_array(a)) as u64;
+                // rd ← u64[rs1 + offset]
+            }
+            Instruction::LBU { rs, rd, offset } => {
+                // rd ← u8[rs1 + offset]
+                let a = self.registers[rs] as usize + (offset as usize);
+                self.registers[rd] = u8::from_le_bytes(self.memory.load_array(a)) as u64;
+            }
+            Instruction::LHU { rs, rd, offset } => {
+                // rd ← u16[rs1 + offset]
+                let a = self.registers[rs] as usize + (offset as usize);
+                self.registers[rd] = u16::from_le_bytes(self.memory.load_array(a)) as u64;
+            }
+            Instruction::LWU { rs, rd, offset } => {
+                // rd ← u32[rs1 + offset]
+                let a = self.registers[rs] as usize + (offset as usize);
+                self.registers[rd] = u32::from_le_bytes(self.memory.load_array(a)) as u64;
+            }
+            Instruction::ADDI { rd, rs, imm } => {
+                // rd ← rs1 + sx(imm)
+                self.registers[rd] =
+                    (self.registers[rs] as i128).wrapping_add(imm as i16 as i128) as u64
+            }
+            Instruction::SLTI { rd, rs, imm } => {
+                // rd ← sx(rs1) < sx(imm)
+                fn shlsar(x: u16, n: i8) -> i32 {
+                    ((x << n) as i16 >> n) as i32
+                }
+                self.registers[rd] =
+                    if (self.registers[rs] as i32) < shlsar(imm, 16 - 11) { 1 } else { 0 };
+            }
+            Instruction::SLTIU { rd, rs, imm } => {
+                self.registers[rd] = if (self.registers[rs] as u32) < (imm as u32) { 1 } else { 0 };
+                // rd ← ux(rs1) < ux(imm)
+            }
+            Instruction::XORI { rd, rs, imm } => {
+                // rd ← ux(rs1) ⊕ ux(imm)
+                self.registers[rd] = self.registers[rs] ^ imm as u64
+            }
+            Instruction::ORI { rd, rs, imm } => {
+                // rd ← ux(rs1) ∨ ux(imm)
+                self.registers[rd] = self.registers[rs] | imm as u64
+            }
+            Instruction::ANDI { rd, rs, imm } => {
+                // rd ← ux(rs1) ∧ ux(imm)
+                self.registers[rd] = self.registers[rs] & imm as u64
+            }
+            Instruction::SLLI { rd, rs, imm } => {
+                // rd ← ux(rs1) « ux(imm)
+                self.registers[rd] = self.registers[rs] << imm
+            }
+            Instruction::SRLI { rd, rs, imm } => {
+                // rd ← ux(rs1) » ux(imm)
+                self.registers[rd] = self.registers[rs] >> imm
+            }
+            Instruction::SRAI { rd, rs, imm } => {
+                // rd ← sx(rs1) » ux(imm)
+                self.registers[rd] = ((self.registers[rs] as i64) >> imm) as u64
+            }
+            Instruction::ADDIW { rd, rs, imm } => {
+                // rd ← s32(rs1) + imm
+                self.registers[rd] =
+                    (self.registers[rs] as i32).wrapping_add(((imm as i16) << 4 >> 4) as i32) as u64
+            }
+            Instruction::SLLIW { rd, rs, imm } => {
+                // rd ← s32(u32(rs1) « imm)
+                self.registers[rd] = ((self.registers[rs] as i32) << imm) as u32 as u64
+            }
+            Instruction::SRLIW { rd, rs, imm } => {
+                // rd ← s32(u32(rs1) » imm)
+                self.registers[rd] = ((self.registers[rs] as u32) >> imm) as u32 as u64
+            }
+            Instruction::SRAIW { rd, rs, imm } => {
+                // rd ← s32(rs1) » imm
+                self.registers[rd] = ((self.registers[rs] as i32) >> imm) as u32 as u64
+            }
+            Instruction::JALR { rd, rs, offset } => {
+                // rd ← pc + length(inst), pc ← (rs1 + offset) ∧ -2
+                let ret = (self.program_counter + 4) as u64;
+                let seoffset = ((offset << 11) as i16 >> 11) as i64;
+                self.program_counter = self.registers[rs].wrapping_add(seoffset as u64) as usize;
+                self.registers[rd] = ret;
+            }
+            Instruction::JAL { rd, offset } => {
+                // rd ← pc + length(inst), pc ← pc + offset
+                self.registers[rd] = self.program_counter.wrapping_add(4) as u64;
+                self.program_counter = self.program_counter.wrapping_add(offset as usize);
+            }
+            Instruction::ADD { rd, rs1, rs2 } => {
+                // rd ← sx(rs1) + sx(rs2)
+                self.registers[rd] =
+                    (self.registers[rs1] as i64).wrapping_add(self.registers[rs2] as i64) as u64
+            }
+            Instruction::SUB { rd, rs1, rs2 } => {
+                // rd ← sx(rs1) - sx(rs2)
+                self.registers[rd] =
+                    (self.registers[rs1] as i64).wrapping_sub(self.registers[rs2] as i64) as u64
+            }
+            Instruction::SLL { rd, rs1, rs2 } => {
+                // rd ← ux(rs1) « rs2
+                self.registers[rd] = self.registers[rs1].wrapping_shl(self.registers[rs2] as u32)
+            }
+            Instruction::SLT { rd, rs1, rs2 } => {
+                // rd ← sx(rs1) < sx(rs2)
+                self.registers[rd] =
+                    if (self.registers[rs1] as i64) < (self.registers[rs2] as i64) { 1 } else { 0 };
+            }
+            Instruction::SLTU { rd, rs1, rs2 } => {
+                // rd ← ux(rs1) < ux(rs2)
+                self.registers[rd] = if self.registers[rs1] < self.registers[rs2] { 1 } else { 0 };
+            }
+            Instruction::XOR { rd, rs1, rs2 } => {
+                // rd ← ux(rs1) ⊕ ux(rs2)
+                self.registers[rd] = self.registers[rs1] ^ self.registers[rs2];
+            }
+            Instruction::SRL { rd, rs1, rs2 } => {
+                // rd ← ux(rs1) » rs2
+                self.registers[rd] = self.registers[rs1].wrapping_shr(self.registers[rs2] as u32)
+            }
+            Instruction::SRA { rd, rs1, rs2 } => {
+                // rd ← sx(rs1) » rs2
+                self.registers[rd] =
+                    (self.registers[rs1] as i64).wrapping_shr(self.registers[rs2] as u32) as u64
+            }
+            Instruction::OR { rd, rs1, rs2 } => {
+                // rd ← ux(rs1) ∨ ux(rs2)
+                self.registers[rd] = self.registers[rs1] | self.registers[rs2];
+            }
+            Instruction::AND { rd, rs1, rs2 } => {
+                // rd ← ux(rs1) ∧ ux(rs2)
+                self.registers[rd] = self.registers[rs1] & self.registers[rs2];
+            }
+            Instruction::ADDW { rd, rs1, rs2 } => {
+                // rd ← s32(rs1) + s32(rs2)
+                self.registers[rd] =
+                    (self.registers[rs1] as i32).wrapping_add(self.registers[rs2] as i32) as u64;
+            }
+            Instruction::SUBW { rd, rs1, rs2 } => {
+                // rd ← s32(rs1) - s32(rs2)
+                self.registers[rd] =
+                    (self.registers[rs1] as i32).wrapping_sub(self.registers[rs2] as i32) as u64;
+            }
+            Instruction::SLLW { rd, rs1, rs2 } => {
+                // rd ← s32(u32(rs1) « rs2)
+                self.registers[rd] =
+                    (self.registers[rs1] as u32).wrapping_shl(self.registers[rs2] as u32) as u64;
+            }
+            Instruction::SRLW { rd, rs1, rs2 } => {
+                // rd ← s32(u32(rs1) » rs2)
+                self.registers[rd] =
+                    (self.registers[rs1] as u32).wrapping_shr(self.registers[rs2] as u32) as u64;
+            }
+            Instruction::SRAW { rd, rs1, rs2 } => {
+                // rd ← s32(rs1) » rs2
+                self.registers[rd] = (self.registers[rs1] as i32)
+                    .wrapping_shr(self.registers[rs2] as u32)
+                    as u32 as u64;
+            }
+            Instruction::SB { rs1, rs2, offset } => {
+                // u8[rs1 + offset] ← rs2
+                let a = self.registers[rs1] as usize + (offset as usize);
+                self.memory.store_slice(a, &(self.registers[rs2] as u8).to_le_bytes());
+            }
+            Instruction::SH { rs1, rs2, offset } => {
+                // u16[rs1 + offset] ← rs2
+                let a = self.registers[rs1] as usize + (offset as usize);
+                self.memory.store_slice(a, &(self.registers[rs2] as u16).to_le_bytes());
+            }
+            Instruction::SW { rs1, rs2, offset } => {
+                // u32[rs1 + offset] ← rs2
+                let a = self.registers[rs1] as usize + (offset as usize);
+                self.memory.store_slice(a, &(self.registers[rs2] as u32).to_le_bytes());
+            }
+            Instruction::SD { rs1, rs2, offset } => {
+                // u64[rs1 + offset] ← rs2
+                let a = self.registers[rs1] as usize + (offset as usize);
+                self.memory.store_slice(a, &(self.registers[rs2] as u64).to_le_bytes());
+            }
+            Instruction::LUI { rd, imm } => {
+                // rd ← imm
+                self.registers[rd] = ((imm as u32) << 12) as u64
+            }
+            Instruction::AUIPC { rd, offset } => {
+                // rd ← pc + offset
+                self.registers[rd] = ((offset as u32 + self.program_counter as u32) << 12) as u64
+            }
+            Instruction::BEQ { rs1, rs2, offset } => {
+                // if rs1 = rs2 then pc ← pc + offset
+                if self.registers[rs1] == self.registers[rs2] {
+                    self.program_counter = ((self.program_counter as i128)
+                        + ((offset as i16) << 4 >> 4) as i128)
+                        as usize;
+                }
+            }
+            Instruction::BNE { rs1, rs2, offset } => {
+                // if rs1 ≠ rs2 then pc ← pc + offset
+                if self.registers[rs1] != self.registers[rs2] {
+                    self.program_counter = ((self.program_counter as i128)
+                        + ((offset as i16) << 4 >> 4) as i128)
+                        as usize;
+                }
+            }
+            Instruction::BLT { rs1, rs2, offset } => {
+                // if rs1 < rs2 then pc ← pc + offset
+                if (self.registers[rs1] as i64) < (self.registers[rs2] as i64) {
+                    self.program_counter = ((self.program_counter as i128)
+                        + ((offset as i16) << 4 >> 4) as i128)
+                        as usize;
+                }
+            }
+            Instruction::BGE { rs1, rs2, offset } => {
+                // if rs1 ≥ rs2 then pc ← pc + offset
+                if (self.registers[rs1] as i64) >= (self.registers[rs2] as i64) {
+                    self.program_counter = ((self.program_counter as i128)
+                        + ((offset as i16) << 4 >> 4) as i128)
+                        as usize;
+                }
+            }
+            Instruction::BLTU { rs1, rs2, offset } => {
+                // if rs1 < rs2 then pc ← pc + offset
+                if (self.registers[rs1] as u64) < (self.registers[rs2] as u64) {
+                    self.program_counter = ((self.program_counter as i128)
+                        + ((offset as i16) << 4 >> 4) as i128)
+                        as usize;
+                }
+            }
+            Instruction::BGEU { rs1, rs2, offset } => {
+                // if rs1 ≥ rs2 then pc ← pc + offset
+                if (self.registers[rs1] as u64) >= (self.registers[rs2] as u64) {
+                    self.program_counter = ((self.program_counter as i128)
+                        + ((offset as i16) << 4 >> 4) as i128)
+                        as usize;
+                }
+            }
+            Instruction::FENCE { pred, succ } => {
+                unimplemented!("instruction FENCE not implemented");
+            }
+            Instruction::FENCEI {} => {
+                unimplemented!("instruction FENCEI not implemented");
+            }
+            Instruction::ECALL {} => {
+                unimplemented!("instruction ECALL not implemented");
+            }
+            Instruction::EBREAK {} => {
+                unimplemented!("instruction EBREAK not implemented");
+            }
+            Instruction::CSRRW { rs, rd, csr } => {
+                unimplemented!("instruction CSRRW not implemented");
+            }
+            Instruction::CSRRS { rs, rd, csr } => {
+                unimplemented!("instruction CSRRS not implemented");
+            }
+            Instruction::CSRRC { rs, rd, csr } => {
+                unimplemented!("instruction CSRRC not implemented");
+            }
+            Instruction::CSRRWI { zimm, rd, csr } => {
+                unimplemented!("instruction CSRRWI not implemented");
+            }
+            Instruction::CSRRSI { zimm, rd, csr } => {
+                unimplemented!("instruction CSRRSI not implemented");
+            }
+            Instruction::CSRRCI { zimm, rd, csr } => {
+                unimplemented!("instruction CSRRCI not implemented");
+            }
+            Instruction::UNKNOWN { instruction } => {
+                panic!("unknown instruction: {:X}", instruction);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::{instructions::Instruction, types::Memory};
+
+    use super::Machine;
+
     #[test]
-    fn it_works() {
-        // let mut m = crate::machine::Machine::new_with_instructions(&[
-        //     crate::instructions::Instruction::ADDW {
-        //         rd: 0,
-        //         rs1: 1,
-        //         rs2: 2,
-        //     },
-        // ]);
-        // m.run();
+    fn test_lb() {
+        fn t(x: u64, offset: usize) -> u64 {
+            let mut m = Machine::new();
+            let a: u64 = 0x1000;
+            m.registers[10] = a as u64 - offset as u64;
+            m.memory.store_slice(a as usize, &x.to_le_bytes());
+            m.execute(Instruction::LB { rs: 10, rd: 10, offset: offset as u16 });
+            m.registers[10]
+        }
+        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x80), 0xFFFFFFF0)
     }
+    #[test]
+    fn test_lh() {
+        fn t(x: u64, offset: i16) -> u64 {
+            let mut m = Machine::new();
+            let a = 0x1000;
+            m.registers[10] = a as u64 - offset as u64;
+            m.memory.store_slice(a as usize, &x.to_le_bytes());
+            m.execute(Instruction::LH { rs: 10, rd: 10, offset: offset as u16 });
+            m.registers[10]
+        }
+        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x80), 0xFFFFF1F0)
+    }
+    #[test]
+    fn test_lw() {
+        fn t(x: u64, offset: i16) -> u64 {
+            let mut m = Machine::new();
+            let a = 0x1000;
+            m.registers[10] = a as u64 - offset as u64;
+            m.memory.store_slice(a as usize, &x.to_le_bytes());
+            m.execute(Instruction::LW { rs: 10, rd: 10, offset: offset as u16 });
+            m.registers[10]
+        }
+        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x80), 0xFFFFFFFFF3F2F1F0)
+    }
+    #[test]
+    fn test_ld() {
+        fn t(x: u64, offset: i16) -> u64 {
+            let mut m = Machine::new();
+            let a = 0x1000;
+            m.registers[10] = a as u64 - offset as u64;
+            m.memory.store_slice(a as usize, &x.to_le_bytes());
+            m.execute(Instruction::LD { rs: 10, rd: 10, offset: offset as u16 });
+            m.registers[10]
+        }
+        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x80), 0xF7F6F5F4F3F2F1F0)
+    }
+    #[test]
+    fn test_lbu() {
+        fn t(x: u64, offset: i16) -> u64 {
+            let mut m = Machine::new();
+            let a = 0x1000;
+            m.registers[10] = a as u64 - offset as u64;
+            m.memory.store_slice(a as usize, &x.to_le_bytes());
+            m.execute(Instruction::LBU { rs: 10, rd: 10, offset: offset as u16 });
+            m.registers[10]
+        }
+        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x80), 0x000000F0)
+    }
+    #[test]
+    fn test_lhu() {
+        fn t(x: u64, offset: i16) -> u64 {
+            let mut m = Machine::new();
+            let a = 0x1000;
+            m.registers[10] = a as u64 - offset as u64;
+            m.memory.store_slice(a as usize, &x.to_le_bytes());
+            m.execute(Instruction::LHU { rs: 10, rd: 10, offset: offset as u16 });
+            m.registers[10]
+        }
+        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x80), 0x0000F1F0)
+    }
+    #[test]
+    fn test_lwu() {
+        fn t(x: u64, offset: i16) -> u64 {
+            let mut m = Machine::new();
+            let a = 0x1000;
+            m.registers[10] = a as u64 - offset as u64;
+            m.memory.store_slice(a as usize, &x.to_le_bytes());
+            m.execute(Instruction::LWU { rs: 10, rd: 10, offset: offset as u16 });
+            m.registers[10]
+        }
+        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x80), 0x0000000F3F2F1F0)
+    }
+    #[test]
+    fn test_addi() {
+        fn t(a: u64, i: u16) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a;
+            m.execute(Instruction::ADDI { rd: 10, rs: 10, imm: i });
+            m.registers[10]
+        }
+        assert_eq!(t(0x1000, 2), 0x1002);
+    }
+    #[test]
+    fn test_slli() {
+        fn t(a: u64, i: u8) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a;
+            m.execute(Instruction::SLLI { rd: 10, rs: 10, imm: i });
+            m.registers[10]
+        }
+        assert_eq!(t(0x1000, 4), 0x10000);
+    }
+
+    #[test]
+    fn test_slti() {
+        fn t(a: u64, i: i16) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a;
+            m.execute(Instruction::SLTI { rd: 10, rs: 10, imm: i as u16 });
+            m.registers[10]
+        }
+        assert_eq!(t(1, -1), 0);
+        assert_eq!(t(1, 5), 1);
+    }
+    #[test]
+    fn test_sltiu() {
+        fn t(a: u64, i: i16) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a;
+            m.execute(Instruction::SLTIU { rd: 10, rs: 10, imm: i as u16 });
+            m.registers[10]
+        }
+        assert_eq!(t(1, 0), 0);
+        assert_eq!(t(66, 9999), 1);
+    }
+
+    #[test]
+    fn test_xori() {
+        fn t(a: u64, i: u16) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a;
+            m.execute(Instruction::XORI { rd: 10, rs: 10, imm: i });
+            m.registers[10]
+        }
+        assert_eq!(t(0xAA, 0x3C), 0b10010110);
+    }
+    #[test]
+    fn test_srli() {
+        fn t(a: u64, i: u8) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a;
+            m.execute(Instruction::SRLI { rd: 10, rs: 10, imm: i });
+            m.registers[10]
+        }
+        assert_eq!(t(0xA7A6A5A4A3A2A1A0, 24), 0x000000A7A6A5A4A3);
+    }
+    #[test]
+    fn test_srai() {
+        fn t(a: u64, i: u8) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a;
+            m.execute(Instruction::SRAI { rd: 10, rs: 10, imm: i });
+            m.registers[10]
+        }
+
+        assert_eq!(t(0xA7A6A5A4A3A2A1A0, 24), 0xFFFFFFA7A6A5A4A3);
+    }
+    #[test]
+    fn test_ori() {
+        fn t(a: u64, i: u16) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a;
+            m.execute(Instruction::ORI { rd: 10, rs: 10, imm: i });
+            m.registers[10]
+        }
+        assert_eq!(t(0xAA, 0x3C), 0b10111110);
+    }
+    #[test]
+    fn test_andi() {
+        fn t(a: u64, i: u16) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a;
+            m.execute(Instruction::ANDI { rd: 10, rs: 10, imm: i });
+            m.registers[10]
+        }
+        assert_eq!(t(0xAA, 0x3C), 0b00101000);
+    }
+    #[test]
+    fn test_addiw() {
+        fn t(a: i64, i: i16) -> i64 {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.execute(Instruction::ADDIW { rd: 10, rs: 10, imm: i as u16 });
+            m.registers[10] as i64
+        }
+        assert_eq!(t(0, -1), -1);
+        assert_eq!(t(-1, -1), -2);
+    }
+    #[test]
+    fn test_slliw() {
+        fn t(a: u64, i: u8) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a;
+            m.execute(Instruction::SLLIW { rd: 10, rs: 10, imm: i });
+            m.registers[10]
+        }
+        assert_eq!(t(0xA7A6A5A4A3A2A1A0, 8), 0xA2A1A000);
+    }
+    #[test]
+    fn test_srliw() {
+        fn t(a: u64, i: u8) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a;
+            m.execute(Instruction::SRLIW { rd: 10, rs: 10, imm: i });
+            m.registers[10]
+        }
+        assert_eq!(t(0xA7A6A5A4A3A2A1A0, 8), 0x00A3A2A1);
+    }
+    #[test]
+    fn test_sraiw() {
+        fn t(a: u64, i: u8) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a;
+            m.execute(Instruction::SRAIW { rd: 10, rs: 10, imm: i });
+            m.registers[10]
+        }
+        assert_eq!(t(0xA7A6A5A4A3A2A1A0, 8), 0xFFA3A2A1);
+    }
+
+    #[test]
+    fn test_jalr() {
+        let mut m = Machine::new();
+        m.program_counter = 0xF7F6F5F4F3F2F1F0;
+        m.registers[10] = 0x2000;
+        m.execute(Instruction::JALR { rd: 10, rs: 10, offset: 7 });
+        assert_eq!(m.program_counter, 0x2007);
+        assert_eq!(m.registers[10], 0xF7F6F5F4F3F2F1F4);
+
+        m.program_counter = 0xF7F6F5F4F3F2F1F0;
+        m.registers[11] = 0x2000;
+        m.execute(Instruction::JALR { rd: 10, rs: 11, offset: 0b11111111010 });
+        assert_eq!(m.program_counter, 0x1FFA);
+        assert_eq!(m.registers[10], 0xF7F6F5F4F3F2F1F4);
+    }
+    #[test]
+    fn test_jal() {
+        fn t(pc: usize, offset: u32) -> (usize, u64) {
+            let mut m = Machine::new();
+            m.program_counter = pc;
+            m.execute(Instruction::JAL { rd: 10, offset: offset });
+            (m.program_counter, m.registers[10])
+        }
+        assert_eq!(t(0xF000, 0xA0), (0xF0A0, 0xF004));
+    }
+    #[test]
+    fn test_add() {
+        let mut m = Machine::new();
+        m.registers[10] = 0x5756555453525150;
+        m.registers[11] = 0x5F5E5D5C5B5A5958;
+        m.execute(Instruction::ADD { rd: 10, rs1: 10, rs2: 11 });
+        assert_eq!(m.registers[10], 0xB6B4B2B0AEACAAA8);
+
+        m.registers[10] = 22;
+        m.registers[11] = -1 as i64 as u64;
+        m.execute(Instruction::ADD { rd: 10, rs1: 10, rs2: 11 });
+        assert_eq!(m.registers[10], 21);
+    }
+    #[test]
+    fn test_sub() {
+        let mut m = Machine::new();
+        m.registers[10] = 0x5F5E5D5C5B5A5958;
+        m.registers[11] = 0x5756555453525150;
+        m.execute(Instruction::SUB { rd: 10, rs1: 10, rs2: 11 });
+        assert_eq!(m.registers[10], 0x0808080808080808);
+    }
+    #[test]
+    fn test_sll() {
+        fn t(a: u64, b: u64) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::SLL { rd: 10, rs1: 10, rs2: 11 });
+            m.registers[10]
+        }
+        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0), 0xF7F6F5F4F3F2F1F0);
+        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 8), 0xF6F5F4F3F2F1F000);
+    }
+    #[test]
+    fn test_slt() {
+        fn t(a: i64, b: i64) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::SLT { rd: 10, rs1: 10, rs2: 11 });
+            m.registers[10]
+        }
+        assert_eq!(t(1, -1), 0);
+        assert_eq!(t(1, 5), 1);
+    }
+    #[test]
+    fn test_sltu() {
+        fn t(a: i64, b: i64) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::SLTU { rd: 10, rs1: 10, rs2: 11 });
+            m.registers[10]
+        }
+        assert_eq!(t(1, 0), 0);
+        assert_eq!(t(66, 9999), 1);
+    }
+    #[test]
+    fn test_xor() {
+        fn t(a: u64, b: u64) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::XOR { rd: 10, rs1: 10, rs2: 11 });
+            m.registers[10]
+        }
+        assert_eq!(t(0b10101010, 0b00111100), 0b10010110);
+    }
+    #[test]
+    fn test_srl() {
+        fn t(a: u64, b: u64) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::SRL { rd: 10, rs1: 10, rs2: 11 });
+            m.registers[10]
+        }
+        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 32), 0x00000000F7F6F5F4);
+    }
+    #[test]
+    fn test_sra() {
+        fn t(a: u64, b: u64) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::SRA { rd: 10, rs1: 10, rs2: 11 });
+            m.registers[10]
+        }
+        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 32), 0xFFFFFFFFF7F6F5F4);
+    }
+    #[test]
+    fn test_or() {
+        fn t(a: u64, b: u64) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::OR { rd: 10, rs1: 10, rs2: 11 });
+            m.registers[10]
+        }
+        assert_eq!(t(0b10101010, 0b00111100), 0b10111110);
+    }
+    #[test]
+    fn test_and() {
+        fn t(a: u64, b: u64) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::AND { rd: 10, rs1: 10, rs2: 11 });
+            m.registers[10]
+        }
+        assert_eq!(t(0b10101010, 0b00111100), 0b00101000);
+    }
+    #[test]
+    fn test_addw() {
+        fn t(a: u64, b: u64) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::ADDW { rd: 10, rs1: 10, rs2: 11 });
+            m.registers[10]
+        }
+        assert_eq!(t(10, 7), 17);
+    }
+    #[test]
+    fn test_subw() {
+        fn t(a: u64, b: u64) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::SUBW { rd: 10, rs1: 10, rs2: 11 });
+            m.registers[10]
+        }
+        assert_eq!(t(10, 7), 3);
+    }
+    #[test]
+    fn test_sllw() {
+        fn t(a: u64, b: u64) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::SLLW { rd: 10, rs1: 10, rs2: 11 });
+            m.registers[10]
+        }
+        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 8), 0x00000000F2F1F000);
+    }
+    #[test]
+    fn test_srlw() {
+        fn t(a: u64, b: u64) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::SRLW { rd: 10, rs1: 10, rs2: 11 });
+            m.registers[10]
+        }
+        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 8), 0x0000000000F3F2F1);
+    }
+    #[test]
+    fn test_sraw() {
+        fn t(a: u64, b: u64) -> u64 {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::SRAW { rd: 10, rs1: 10, rs2: 11 });
+            m.registers[10]
+        }
+        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 8), 0x00000000FFF3F2F1);
+    }
+    #[test]
+    fn test_sb() {
+        fn t(a: u64, b: u64, i: u16) -> [u8; 8] {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::SB { rs1: 10, rs2: 11, offset: i });
+            m.memory.load_array(2000)
+        }
+
+        assert_eq!(t(2000, 0xA7A6A5A4A3A2A1A0, 0), [0xA0, 0, 0, 0, 0, 0, 0, 0])
+    }
+    #[test]
+    fn test_sh() {
+        fn t(a: u64, b: u64, i: u16) -> [u8; 8] {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::SH { rs1: 10, rs2: 11, offset: i });
+            m.memory.load_array(2000)
+        }
+
+        assert_eq!(t(2000, 0xA7A6A5A4A3A2A1A0, 0), [0xA0, 0xA1, 0, 0, 0, 0, 0, 0])
+    }
+    #[test]
+    fn test_sw() {
+        fn t(a: u64, b: u64, i: u16) -> [u8; 8] {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::SW { rs1: 10, rs2: 11, offset: i });
+            m.memory.load_array(2000)
+        }
+
+        assert_eq!(t(2000, 0xA7A6A5A4A3A2A1A0, 0), [0xA0, 0xA1, 0xA2, 0xA3, 0, 0, 0, 0])
+    }
+    #[test]
+    fn test_sd() {
+        fn t(a: u64, b: u64, i: u16) -> [u8; 8] {
+            let mut m = Machine::new();
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::SD { rs1: 10, rs2: 11, offset: i });
+            m.memory.load_array(2000)
+        }
+
+        assert_eq!(t(2000, 0xA7A6A5A4A3A2A1A0, 0), [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7])
+    }
+    #[test]
+    fn test_beq() {
+        fn t(a: u64, b: u64, offset: i16) -> usize {
+            let mut m = Machine::new();
+            m.program_counter = 0x1000;
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::BEQ { rs1: 10, rs2: 11, offset: offset as u16 });
+            m.program_counter
+        }
+        assert_eq!(t(0xA, 0xA, 0x3FF), 0x13FF);
+        assert_eq!(t(0xA, 0xB, 0x3FF), 0x1000);
+    }
+    #[test]
+    fn test_bne() {
+        fn t(a: u64, b: u64, offset: i16) -> usize {
+            let mut m = Machine::new();
+            m.program_counter = 0x1000;
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::BNE { rs1: 10, rs2: 11, offset: offset as u16 });
+            m.program_counter
+        }
+        assert_eq!(t(0xA, 0xB, 1), 0x1001);
+        assert_eq!(t(0xA, 0xA, 1), 0x1000);
+    }
+    #[test]
+    fn test_blt() {
+        fn t(a: u64, b: u64, offset: i16) -> usize {
+            let mut m = Machine::new();
+            m.program_counter = 0x1000;
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::BLT { rs1: 10, rs2: 11, offset: offset as u16 });
+            m.program_counter
+        }
+        assert_eq!(t(0xA, 0xB, 0x1), 0x1001);
+        assert_eq!(t(0xB, 0xB, 0x1), 0x1000);
+        assert_eq!(t(0xC, 0xB, 0x1), 0x1000);
+    }
+    #[test]
+    fn test_bge() {
+        fn t(a: u64, b: u64, offset: i16) -> usize {
+            let mut m = Machine::new();
+            m.program_counter = 0x1000;
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::BGE { rs1: 10, rs2: 11, offset: offset as u16 });
+            m.program_counter
+        }
+        assert_eq!(t(0xA, 0xB, 0x1), 0x1000);
+        assert_eq!(t(0xB, 0xB, 0x1), 0x1001);
+        assert_eq!(t(0xC, 0xB, 0x1), 0x1001);
+    }
+    #[test]
+    fn test_bltu() {
+        fn t(a: u64, b: u64, offset: i16) -> usize {
+            let mut m = Machine::new();
+            m.program_counter = 0x1000;
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::BLTU { rs1: 10, rs2: 11, offset: offset as u16 });
+            m.program_counter
+        }
+        assert_eq!(t(0xA, 0xB, 0x1), 0x1001);
+        assert_eq!(t(0xB, 0xB, 0x1), 0x1000);
+        assert_eq!(t(0xC, 0xB, 0x1), 0x1000);
+    }
+    #[test]
+    fn test_bgeu() {
+        fn t(a: u64, b: u64, offset: i16) -> usize {
+            let mut m = Machine::new();
+            m.program_counter = 0x1000;
+            m.registers[10] = a as u64;
+            m.registers[11] = b as u64;
+            m.execute(Instruction::BGEU { rs1: 10, rs2: 11, offset: offset as u16 });
+            m.program_counter
+        }
+        assert_eq!(t(0xA, 0xB, 0x1), 0x1000);
+        assert_eq!(t(0xB, 0xB, 0x1), 0x1001);
+        assert_eq!(t(0xC, 0xB, 0x1), 0x1001);
+    }
+    #[test]
+    fn test_auipc() {
+        fn t(offset: u32, pc: usize) -> u64 {
+            let mut m = Machine::new();
+            m.program_counter = pc;
+            m.execute(Instruction::AUIPC { rd: 10, offset });
+            m.registers[10]
+        }
+        assert_eq!(t(0xB, 0xA0), 0xAB000);
+        assert_eq!(t(0xF0F0F0F0, 0x1), 0x0F0F1000);
+    }
+    #[test]
+    fn test_lui() {
+        fn t(offset: u32) -> u64 {
+            let mut m = Machine::new();
+            m.execute(Instruction::LUI { rd: 10, imm: offset });
+            m.registers[10]
+        }
+        assert_eq!(t(0xB), 0xB000);
+        assert_eq!(t(0xF0F0F0F0), 0x0F0F0000);
+    }
+    // #[test]
+    // fn test_fence() {}
+    // #[test]
+    // fn test_fencei() {}
+    // #[test]
+    // fn test_ecall() {}
+    // #[test]
+    // fn test_ebreak() {}
+    // #[test]
+    // fn test_csrrw() {}
+    // #[test]
+    // fn test_csrrs() {}
+    // #[test]
+    // fn test_csrrc() {}
+    // #[test]
+    // fn test_csrrwi() {}
+    // #[test]
+    // fn test_csrrsi() {}
+    // #[test]
+    // fn test_csrrci() {}
+    // #[test]
+    // fn test_unknown() {}
 }
