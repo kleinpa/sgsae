@@ -10,7 +10,7 @@ pub trait Memory {
             self.store(a.wrapping_add(i.try_into().unwrap()), *x);
         }
     }
-    fn load_array<const N: usize>(&mut self, a: Address) -> [u8; N] {
+    fn load_array<const N: usize>(&self, a: Address) -> [u8; N] {
         let mut xs = [0u8; N];
         for i in 0..N {
             xs[i] = self.load(a.wrapping_add(i.try_into().unwrap()));

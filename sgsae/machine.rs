@@ -105,7 +105,23 @@ impl Machine {
         return Instruction::decode(data);
     }
 
+    fn read_register(&self, i: u8) -> u64 {
+        if i == 0 {
+            0
+        } else {
+            self.registers[usize::from(i)]
+        }
+    }
+    fn write_register(&mut self, i: u8, x: u64) {
+        if i == 0 {
+            return;
+        }
+        let x: u64 = x.into();
+        self.registers[usize::from(i)] = x;
+    }
+
     fn execute(&mut self, instruction: Instruction) -> Result<(), ExecutionError> {
+        /// Add a signed
         fn addiu(a: u64, b: i32) -> u64 {
             a.wrapping_add(b as u64)
         }
@@ -114,335 +130,347 @@ impl Machine {
         match instruction {
             Instruction::LB { rs, rd, offset } => {
                 // rd ← s8[rs1 + offset]
-                let a = addiu(self.registers[usize::from(rs)], i32::from(offset));
-                self.registers[usize::from(rd)] =
-                    u64::from(i8::from_le_bytes(self.memory.load_array(a)) as u32);
+                let a = addiu(self.read_register(rs), i32::from(offset));
+                self.write_register(rd, i8::from_le_bytes(self.memory.load_array(a)) as u32 as u64);
                 Ok(())
             }
             Instruction::LH { rs, rd, offset } => {
                 // rd ← s16[rs1 + offset]
-                let a = addiu(self.registers[usize::from(rs)], i32::from(offset));
-                self.registers[usize::from(rd)] =
-                    u64::from(i16::from_le_bytes(self.memory.load_array(a)) as u32);
+                let a = addiu(self.read_register(rs), i32::from(offset));
+                self.write_register(
+                    rd,
+                    u64::from(i16::from_le_bytes(self.memory.load_array(a)) as u32),
+                );
                 Ok(())
             }
             Instruction::LW { rs, rd, offset } => {
                 // rd ← s32[rs1 + offset]
-                let a = addiu(self.registers[usize::from(rs)], i32::from(offset));
-                self.registers[usize::from(rd)] =
-                    i32::from_le_bytes(self.memory.load_array(a)) as u64;
+                let a = addiu(self.read_register(rs), i32::from(offset));
+                self.write_register(rd, i32::from_le_bytes(self.memory.load_array(a)) as u64);
                 Ok(())
             }
             Instruction::LD { rs, rd, offset } => {
                 // rd ← u64[rs1 + offset]
-                let a = addiu(self.registers[usize::from(rs)], i32::from(offset));
-                self.registers[usize::from(rd)] =
-                    i64::from_le_bytes(self.memory.load_array(a)) as u64;
+                let a = addiu(self.read_register(rs), i32::from(offset));
+                self.write_register(rd, i64::from_le_bytes(self.memory.load_array(a)) as u64);
                 Ok(())
             }
             Instruction::LBU { rs, rd, offset } => {
                 // rd ← u8[rs1 + offset]
-                let a = addiu(self.registers[usize::from(rs)], i32::from(offset));
-                self.registers[usize::from(rd)] =
-                    u8::from_le_bytes(self.memory.load_array(a)) as u64;
+                let a = addiu(self.read_register(rs), i32::from(offset));
+                self.write_register(rd, u8::from_le_bytes(self.memory.load_array(a)) as u64);
                 Ok(())
             }
             Instruction::LHU { rs, rd, offset } => {
                 // rd ← u16[rs1 + offset]
-                let a = addiu(self.registers[usize::from(rs)], i32::from(offset));
-                self.registers[usize::from(rd)] =
-                    u16::from_le_bytes(self.memory.load_array(a)) as u64;
+                let a = addiu(self.read_register(rs), i32::from(offset));
+                self.write_register(rd, u16::from_le_bytes(self.memory.load_array(a)) as u64);
                 Ok(())
             }
             Instruction::LWU { rs, rd, offset } => {
                 // rd ← u32[rs1 + offset]
-                let a = addiu(self.registers[usize::from(rs)], i32::from(offset));
-                self.registers[usize::from(rd)] =
-                    u32::from_le_bytes(self.memory.load_array(a)) as u64;
+                let a = addiu(self.read_register(rs), i32::from(offset));
+                self.write_register(rd, u32::from_le_bytes(self.memory.load_array(a)) as u64);
                 Ok(())
             }
             Instruction::ADDI { rd, rs, imm } => {
                 // rd ← rs1 + sx(imm)
-                self.registers[usize::from(rd)] =
-                    addiu(self.registers[usize::from(rs)], i32::from(imm));
+                self.write_register(rd, addiu(self.read_register(rs), i32::from(imm)));
                 Ok(())
             }
             Instruction::SLTI { rd, rs, imm } => {
                 // rd ← sx(rs1) < sx(imm)
-                self.registers[usize::from(rd)] =
-                    if (self.registers[usize::from(rs)] as i64) < i64::from(imm) { 1 } else { 0 };
+                self.write_register(
+                    rd,
+                    if (self.read_register(rs) as i64) < i64::from(imm) { 1 } else { 0 },
+                );
                 Ok(())
             }
             Instruction::SLTIU { rd, rs, imm } => {
                 // rd ← ux(rs1) < ux(imm)
-                self.registers[usize::from(rd)] =
-                    if self.registers[usize::from(rs)] < u64::from(imm) { 1 } else { 0 };
+                self.write_register(
+                    rd,
+                    if self.read_register(rs) < u64::from(imm) { 1 } else { 0 },
+                );
                 Ok(())
             }
             Instruction::XORI { rd, rs, imm } => {
                 // rd ← ux(rs1) ⊕ ux(imm)
-                self.registers[usize::from(rd)] = self.registers[usize::from(rs)] ^ u64::from(imm);
+                self.write_register(rd, self.read_register(rs) ^ u64::from(imm));
                 Ok(())
             }
             Instruction::ORI { rd, rs, imm } => {
                 // rd ← ux(rs1) ∨ ux(imm)
-                self.registers[usize::from(rd)] = self.registers[usize::from(rs)] | u64::from(imm);
+                self.write_register(rd, self.read_register(rs) | u64::from(imm));
                 Ok(())
             }
             Instruction::ANDI { rd, rs, imm } => {
                 // rd ← ux(rs1) ∧ ux(imm)
-                self.registers[usize::from(rd)] = self.registers[usize::from(rs)] & u64::from(imm);
+                self.write_register(rd, self.read_register(rs) & u64::from(imm));
                 Ok(())
             }
             Instruction::SLLI { rd, rs, imm } => {
                 // rd ← ux(rs1) « ux(imm)
-                self.registers[usize::from(rd)] =
-                    self.registers[usize::from(rs)].wrapping_shl(u32::from(imm));
+                self.write_register(rd, self.read_register(rs).wrapping_shl(u32::from(imm)));
                 Ok(())
             }
             Instruction::SRLI { rd, rs, imm } => {
                 // rd ← ux(rs1) » ux(imm)
-                self.registers[usize::from(rd)] =
-                    self.registers[usize::from(rs)].wrapping_shr(u32::from(imm));
+                self.write_register(rd, self.read_register(rs).wrapping_shr(u32::from(imm)));
                 Ok(())
             }
             Instruction::SRAI { rd, rs, imm } => {
                 // rd ← sx(rs1) » ux(imm)
-                self.registers[usize::from(rd)] =
-                    (self.registers[usize::from(rs)] as i64).wrapping_shr(u32::from(imm)) as u64;
+                self.write_register(
+                    rd,
+                    (self.read_register(rs) as i64).wrapping_shr(u32::from(imm)) as u64,
+                );
                 Ok(())
             }
             Instruction::ADDIW { rd, rs, imm } => {
                 // rd ← s32(rs1) + imm
-                self.registers[usize::from(rd)] =
-                    (self.registers[usize::from(rs)] as i32).wrapping_add(i32::from(imm)) as u64;
+                self.write_register(
+                    rd,
+                    (self.read_register(rs) as i32).wrapping_add(i32::from(imm)) as u64,
+                );
                 Ok(())
             }
             Instruction::SLLIW { rd, rs, imm } => {
                 // rd ← s32(u32(rs1) « imm)
-                self.registers[usize::from(rd)] = (self.registers[usize::from(rs)] as i32)
-                    .wrapping_shl(u32::from(imm))
-                    as u32 as u64;
+                self.write_register(
+                    rd,
+                    (self.read_register(rs) as i32).wrapping_shl(u32::from(imm)) as u32 as u64,
+                );
                 Ok(())
             }
             Instruction::SRLIW { rd, rs, imm } => {
                 // rd ← s32(u32(rs1) » imm)
-                self.registers[usize::from(rd)] = u64::from(
-                    (self.registers[usize::from(rs)] as u32).wrapping_shr(u32::from(imm)) as u32,
+                self.write_register(
+                    rd,
+                    u64::from((self.read_register(rs) as u32).wrapping_shr(u32::from(imm)) as u32),
                 );
                 Ok(())
             }
             Instruction::SRAIW { rd, rs, imm } => {
                 // rd ← s32(rs1) » imm
-                self.registers[usize::from(rd)] = u64::from(
-                    (self.registers[usize::from(rs)] as i32).wrapping_shr(u32::from(imm)) as u32,
+                self.write_register(
+                    rd,
+                    u64::from((self.read_register(rs) as i32).wrapping_shr(u32::from(imm)) as u32),
                 );
                 Ok(())
             }
             Instruction::JALR { rd, rs, offset } => {
                 // rd ← pc + length(inst), pc ← (rs1 + offset) ∧ -2
                 let ret = self.program_counter.wrapping_add(4);
-                self.program_counter = addiu(self.registers[usize::from(rs)], i32::from(offset));
-                self.registers[usize::from(rd)] = ret;
+                self.program_counter = addiu(self.read_register(rs), i32::from(offset));
+                self.write_register(rd, ret);
                 Ok(())
             }
             Instruction::JAL { rd, offset } => {
                 // rd ← pc + length(inst), pc ← pc + offset
-                self.registers[usize::from(rd)] = self.program_counter.wrapping_add(4);
+                self.write_register(rd, self.program_counter.wrapping_add(4));
                 self.program_counter = addiu(self.program_counter, offset);
                 Ok(())
             }
             Instruction::ADD { rd, rs1, rs2 } => {
                 // rd ← sx(rs1) + sx(rs2)
-                self.registers[usize::from(rd)] = (self.registers[usize::from(rs1)] as i64)
-                    .wrapping_add(self.registers[usize::from(rs2)] as i64)
-                    as u64;
+                self.write_register(
+                    rd,
+                    (self.read_register(rs1) as i64).wrapping_add(self.read_register(rs2) as i64)
+                        as u64,
+                );
                 Ok(())
             }
             Instruction::SUB { rd, rs1, rs2 } => {
                 // rd ← sx(rs1) - sx(rs2)
-                self.registers[usize::from(rd)] = (self.registers[usize::from(rs1)] as i64)
-                    .wrapping_sub(self.registers[usize::from(rs2)] as i64)
-                    as u64;
+                self.write_register(
+                    rd,
+                    (self.read_register(rs1) as i64).wrapping_sub(self.read_register(rs2) as i64)
+                        as u64,
+                );
                 Ok(())
             }
             Instruction::SLL { rd, rs1, rs2 } => {
                 // rd ← ux(rs1) « rs2
-                self.registers[usize::from(rd)] = self.registers[usize::from(rs1)]
-                    .wrapping_shl(self.registers[usize::from(rs2)] as u32);
+                self.write_register(
+                    rd,
+                    self.read_register(rs1).wrapping_shl(self.read_register(rs2) as u32),
+                );
                 Ok(())
             }
             Instruction::SLT { rd, rs1, rs2 } => {
                 // rd ← sx(rs1) < sx(rs2)
-                self.registers[usize::from(rd)] = if (self.registers[usize::from(rs1)] as i64)
-                    < (self.registers[usize::from(rs2)] as i64)
-                {
-                    1
-                } else {
-                    0
-                };
+                //self.write_register(rd.
+                self.write_register(
+                    rd,
+                    if (self.read_register(rs1) as i64) < (self.read_register(rs2) as i64) {
+                        1
+                    } else {
+                        0
+                    },
+                );
                 Ok(())
             }
             Instruction::SLTU { rd, rs1, rs2 } => {
                 // rd ← ux(rs1) < ux(rs2)
-                self.registers[usize::from(rd)] =
-                    if self.registers[usize::from(rs1)] < self.registers[usize::from(rs2)] {
-                        1
-                    } else {
-                        0
-                    };
+                self.write_register(
+                    rd,
+                    if self.read_register(rs1) < self.read_register(rs2) { 1 } else { 0 },
+                );
                 Ok(())
             }
             Instruction::XOR { rd, rs1, rs2 } => {
                 // rd ← ux(rs1) ⊕ ux(rs2)
-                self.registers[usize::from(rd)] =
-                    self.registers[usize::from(rs1)] ^ self.registers[usize::from(rs2)];
+                self.write_register(rd, self.read_register(rs1) ^ self.read_register(rs2));
                 Ok(())
             }
             Instruction::SRL { rd, rs1, rs2 } => {
                 // rd ← ux(rs1) » rs2
-                self.registers[usize::from(rd)] = self.registers[usize::from(rs1)]
-                    .wrapping_shr(self.registers[usize::from(rs2)] as u32);
+                self.write_register(
+                    rd,
+                    self.read_register(rs1).wrapping_shr(self.read_register(rs2) as u32),
+                );
                 Ok(())
             }
             Instruction::SRA { rd, rs1, rs2 } => {
                 // rd ← sx(rs1) » rs2
-                self.registers[usize::from(rd)] = (self.registers[usize::from(rs1)] as i64)
-                    .wrapping_shr(self.registers[usize::from(rs2)] as u32)
-                    as u64;
+                self.write_register(
+                    rd,
+                    (self.read_register(rs1) as i64).wrapping_shr(self.read_register(rs2) as u32)
+                        as u64,
+                );
                 Ok(())
             }
             Instruction::OR { rd, rs1, rs2 } => {
                 // rd ← ux(rs1) ∨ ux(rs2)
-                self.registers[usize::from(rd)] =
-                    self.registers[usize::from(rs1)] | self.registers[usize::from(rs2)];
+                self.write_register(rd, self.read_register(rs1) | self.read_register(rs2));
                 Ok(())
             }
             Instruction::AND { rd, rs1, rs2 } => {
                 // rd ← ux(rs1) ∧ ux(rs2)
-                self.registers[usize::from(rd)] =
-                    self.registers[usize::from(rs1)] & self.registers[usize::from(rs2)];
+                self.write_register(rd, self.read_register(rs1) & self.read_register(rs2));
                 Ok(())
             }
             Instruction::ADDW { rd, rs1, rs2 } => {
                 // rd ← s32(rs1) + s32(rs2)
-                self.registers[usize::from(rd)] = (self.registers[usize::from(rs1)] as i32)
-                    .wrapping_add(self.registers[usize::from(rs2)] as i32)
-                    as u64;
+                self.write_register(
+                    rd,
+                    (self.read_register(rs1) as i32).wrapping_add(self.read_register(rs2) as i32)
+                        as u64,
+                );
                 Ok(())
             }
             Instruction::SUBW { rd, rs1, rs2 } => {
                 // rd ← s32(rs1) - s32(rs2)
-                self.registers[usize::from(rd)] = (self.registers[usize::from(rs1)] as i32)
-                    .wrapping_sub(self.registers[usize::from(rs2)] as i32)
-                    as u64;
+                self.write_register(
+                    rd,
+                    (self.read_register(rs1) as i32).wrapping_sub(self.read_register(rs2) as i32)
+                        as u64,
+                );
                 Ok(())
             }
             Instruction::SLLW { rd, rs1, rs2 } => {
                 // rd ← s32(u32(rs1) « rs2)
-                self.registers[usize::from(rd)] = (self.registers[usize::from(rs1)] as u32)
-                    .wrapping_shl(self.registers[usize::from(rs2)] as u32)
-                    as u64;
+                self.write_register(
+                    rd,
+                    (self.read_register(rs1) as u32).wrapping_shl(self.read_register(rs2) as u32)
+                        as u64,
+                );
                 Ok(())
             }
             Instruction::SRLW { rd, rs1, rs2 } => {
                 // rd ← s32(u32(rs1) » rs2)
-                self.registers[usize::from(rd)] = (self.registers[usize::from(rs1)] as u32)
-                    .wrapping_shr(self.registers[usize::from(rs2)] as u32)
-                    as u64;
+                self.write_register(
+                    rd,
+                    (self.read_register(rs1) as u32).wrapping_shr(self.read_register(rs2) as u32)
+                        as u64,
+                );
                 Ok(())
             }
             Instruction::SRAW { rd, rs1, rs2 } => {
                 // rd ← s32(rs1) » rs2
-                self.registers[usize::from(rd)] = (self.registers[usize::from(rs1)] as i32)
-                    .wrapping_shr(self.registers[usize::from(rs2)] as u32)
-                    as u32 as u64;
+                self.write_register(
+                    rd,
+                    (self.read_register(rs1) as i32).wrapping_shr(self.read_register(rs2) as u32)
+                        as u32 as u64,
+                );
                 Ok(())
             }
             Instruction::SB { rs1, rs2, offset } => {
                 // u8[rs1 + offset] ← rs2
-                let a = addiu(self.registers[usize::from(rs1)], i32::from(offset));
-                self.memory.store_slice(a, &(self.registers[usize::from(rs2)] as u8).to_le_bytes());
+                let a = addiu(self.read_register(rs1), i32::from(offset));
+                self.memory.store_slice(a, &(self.read_register(rs2) as u8).to_le_bytes());
                 Ok(())
             }
             Instruction::SH { rs1, rs2, offset } => {
                 // u16[rs1 + offset] ← rs2
-                let a = addiu(self.registers[usize::from(rs1)], i32::from(offset));
-                self.memory
-                    .store_slice(a, &(self.registers[usize::from(rs2)] as u16).to_le_bytes());
+                let a = addiu(self.read_register(rs1), i32::from(offset));
+                self.memory.store_slice(a, &(self.read_register(rs2) as u16).to_le_bytes());
                 Ok(())
             }
             Instruction::SW { rs1, rs2, offset } => {
                 // u32[rs1 + offset] ← rs2
-                let a = addiu(self.registers[usize::from(rs1)], i32::from(offset));
-                self.memory
-                    .store_slice(a, &(self.registers[usize::from(rs2)] as u32).to_le_bytes());
+                let a = addiu(self.read_register(rs1), i32::from(offset));
+                self.memory.store_slice(a, &(self.read_register(rs2) as u32).to_le_bytes());
                 Ok(())
             }
             Instruction::SD { rs1, rs2, offset } => {
                 // u64[rs1 + offset] ← rs2
-                let a = addiu(self.registers[usize::from(rs1)], i32::from(offset));
-                self.memory
-                    .store_slice(a, &(self.registers[usize::from(rs2)] as u64).to_le_bytes());
+                let a = addiu(self.read_register(rs1), i32::from(offset));
+                self.memory.store_slice(a, &(self.read_register(rs2) as u64).to_le_bytes());
                 Ok(())
             }
             Instruction::LUI { rd, imm } => {
                 // rd ← imm
-                self.registers[usize::from(rd)] = u64::from(imm.wrapping_shl(12));
+                self.write_register(rd, u64::from(imm.wrapping_shl(12)));
                 Ok(())
             }
             Instruction::AUIPC { rd, offset } => {
                 // rd ← pc + offset
-                self.registers[usize::from(rd)] =
-                    (((self.program_counter as u32).wrapping_add(offset as u32)) << 12) as u64;
+                self.write_register(
+                    rd,
+                    (((self.program_counter as u32).wrapping_add(offset as u32)) << 12) as u64,
+                );
                 Ok(())
             }
             Instruction::BEQ { rs1, rs2, offset } => {
                 // if rs1 = rs2 then pc ← pc + offset
-                if self.registers[usize::from(rs1)] == self.registers[usize::from(rs2)] {
+                if self.read_register(rs1) == self.read_register(rs2) {
                     self.program_counter = addiu(self.program_counter as u64, i32::from(offset));
                 }
                 Ok(())
             }
             Instruction::BNE { rs1, rs2, offset } => {
                 // if rs1 ≠ rs2 then pc ← pc + offset
-                if self.registers[usize::from(rs1)] != self.registers[usize::from(rs2)] {
+                if self.read_register(rs1) != self.read_register(rs2) {
                     self.program_counter = addiu(self.program_counter as u64, i32::from(offset));
                 }
                 Ok(())
             }
             Instruction::BLT { rs1, rs2, offset } => {
                 // if rs1 < rs2 then pc ← pc + offset
-                if (self.registers[usize::from(rs1)] as i64)
-                    < (self.registers[usize::from(rs2)] as i64)
-                {
+                if (self.read_register(rs1) as i64) < (self.read_register(rs2) as i64) {
                     self.program_counter = addiu(self.program_counter as u64, i32::from(offset));
                 }
                 Ok(())
             }
             Instruction::BGE { rs1, rs2, offset } => {
                 // if rs1 ≥ rs2 then pc ← pc + offset
-                if (self.registers[usize::from(rs1)] as i64)
-                    >= (self.registers[usize::from(rs2)] as i64)
-                {
+                if (self.read_register(rs1) as i64) >= (self.read_register(rs2) as i64) {
                     self.program_counter = addiu(self.program_counter as u64, i32::from(offset));
                 }
                 Ok(())
             }
             Instruction::BLTU { rs1, rs2, offset } => {
                 // if rs1 < rs2 then pc ← pc + offset
-                if (self.registers[usize::from(rs1)] as u64)
-                    < (self.registers[usize::from(rs2)] as u64)
-                {
+                if (self.read_register(rs1) as u64) < (self.read_register(rs2) as u64) {
                     self.program_counter = addiu(self.program_counter as u64, i32::from(offset));
                 }
                 Ok(())
             }
             Instruction::BGEU { rs1, rs2, offset } => {
                 // if rs1 ≥ rs2 then pc ← pc + offset
-                if (self.registers[usize::from(rs1)] as u64)
-                    >= (self.registers[usize::from(rs2)] as u64)
-                {
+                if (self.read_register(rs1) as u64) >= (self.read_register(rs2) as u64) {
                     self.program_counter = addiu(self.program_counter as u64, i32::from(offset));
                 }
                 Ok(())
@@ -487,6 +515,14 @@ mod tests {
     };
 
     use super::Machine;
+
+    #[test]
+    /// Writes to register[0] should not alter it's value
+    fn test_zero_register() {
+        let mut m = Machine::new();
+        assert!(m.execute(Instruction::ADDI { rd: 0, rs: 0, imm: 1 }).is_ok());
+        assert_eq!(m.registers[0], 0);
+    }
 
     #[test]
     fn test_lb() {
