@@ -64,10 +64,10 @@ mod code {
         bits(x as u32, 5, 7, 25) | bits(x as u32, 0, 5, 7)
     }
     fn get_b_imm(x: u32) -> u16 {
-        (bits(x, 31, 1, 12) | bits(x, 25, 6, 5) | bits(x, 8, 4, 1) | bits(x, 7, 1, 0)) as u16
+        (bits(x, 31, 1, 12) | bits(x, 25, 6, 5) | bits(x, 8, 4, 1) | bits(x, 7, 1, 11)) as u16
     }
     fn set_b_imm(x: u16) -> u32 {
-        bits(x, 12, 1, 31) | bits(x, 5, 6, 25) | bits(x, 1, 4, 8) | bits(x, 0, 1, 7)
+        bits(x, 12, 1, 31) | bits(x, 5, 6, 25) | bits(x, 1, 4, 8) | bits(x, 11, 1, 7)
     }
     fn get_u_imm(x: u32) -> u32 {
         bits(x, 12, 20, 0)
