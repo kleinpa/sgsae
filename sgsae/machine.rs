@@ -1136,4 +1136,38 @@ mod tests {
     fn test_unknown() {
         assert!(Machine::new().execute(Instruction::UNKNOWN { instruction: 0 }).is_err());
     }
+
+    #[test]
+    fn test_program_multiply() {
+        let program = [
+            // main:
+            Instruction::ADDI { rd: 10, rs: 0, imm: 7 }, // a = 7
+            Instruction::ADDI { rd: 11, rs: 0, imm: 8 }, // b = 8
+            Instruction::AUIPC { rd: 6, offset: 0 },     //
+            Instruction::JALR { rd: 1, rs: 6, offset: 2 * 4 }, // a = mul(a,b)
+            Instruction::EBREAK {},                      // exit
+            Instruction::ADD { rd: 12, rs1: 10, rs2: 0 }, // c = a
+            Instruction::ADDI { rd: 10, rs: 0, imm: 0 }, // a = 0
+            Instruction::ADDI { rd: 12, rs: 12, imm: -1 }, // loop: c = c - 1
+            Instruction::ADD { rd: 10, rs1: 10, rs2: 11 }, // a = a + b
+            Instruction::BNE { rs1: 12, rs2: 0, offset: -3 * 4 }, // if c != 0 then loop
+            Instruction::JALR { rd: 0, rs: 1, offset: 0 }, // return
+        ];
+
+        let memory_bytes = {
+            let mut memory_bytes = [0; 65536];
+            let mut i = 0;
+            for instruction in program {
+                let code = instruction.encode().to_le_bytes();
+                memory_bytes[i..i + code.len()].copy_from_slice(&code);
+                i = i + code.len();
+            }
+            memory_bytes
+        };
+
+        let mut m = Machine::new_with_memory(memory_bytes);
+        assert!(m.run().is_err()); // Program should with 'error: instruction EBREAK not implemented'
+        assert_eq!(m.registers[10], 0x38);
+        assert_eq!(m.program_counter, 0x14);
+    }
 }
