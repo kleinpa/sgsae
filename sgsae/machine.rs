@@ -2,9 +2,10 @@ use std::error::Error;
 use std::fmt;
 
 use crate::instructions::Instruction;
-use crate::types::{Memory, ProgramCounter};
+use crate::memory::{Memory, MemoryError, MemoryMap};
+use crate::types::ProgramCounter;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ExecutionError {
     details: String,
 }
@@ -27,82 +28,59 @@ impl Error for ExecutionError {
     }
 }
 
-struct ArrayMemory<const N: usize> {
-    memory: [u8; N],
-}
-impl<const N: usize> ArrayMemory<N> {
-    fn new() -> ArrayMemory<N> {
-        return ArrayMemory { memory: [0; N] };
-    }
-    fn new_with_memory(memory: [u8; N]) -> ArrayMemory<N> {
-        return ArrayMemory { memory: memory };
-    }
-}
-impl<const N: usize> Memory for ArrayMemory<N> {
-    fn load(&self, a: crate::types::Address) -> u8 {
-        return self.memory[usize::try_from(a).unwrap()];
-    }
-
-    fn store(&mut self, a: crate::types::Address, x: u8) {
-        self.memory[usize::try_from(a).unwrap()] = x;
-    }
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum MachineError {
+    Execution(ExecutionError),
+    Memory(MemoryError),
 }
 
-pub struct Machine {
+pub struct Machine<'a> {
     program_counter: ProgramCounter,
     registers: [u64; 32],
-    memory: ArrayMemory<65536>,
+    memory: MemoryMap<'a>,
 }
 
-impl Machine {
-    pub fn new() -> Machine {
-        Machine { program_counter: 0, registers: [0; 32], memory: ArrayMemory::new() }
+impl<'a> Machine<'a> {
+    pub fn new() -> Machine<'a> {
+        Machine { program_counter: 0, registers: [0; 32], memory: MemoryMap::new() }
     }
-    pub fn new_with_memory(memory: [u8; 65536]) -> Machine {
-        Machine {
-            program_counter: 0,
-            registers: [0; 32],
-            memory: ArrayMemory::new_with_memory(memory),
-        }
+
+    pub fn new_with_program(program: &'a [u8]) -> Machine<'a> {
+        let mut machine = Machine::new();
+        machine.memory.map_ro(0, program);
+        machine
     }
+
     pub fn get_registers(&self) -> [u64; 32] {
         self.registers
     }
 
-    // Constructor for tests and experiments. The provided instructions will be copied into memory and executed.
-    pub fn new_with_instructions(instructions: &[Instruction]) -> Machine {
-        let mut m = Machine::new();
-        let mut i = 0; // start address
-
-        for instruction in instructions {
-            let bytes = instruction.encode().to_le_bytes();
-            for x in bytes {
-                m.memory.store(i, x);
-                i = i + 1;
-            }
-        }
-        return m;
-    }
-
-    pub fn run(&mut self) -> Result<(), ExecutionError> {
+    pub fn run(&mut self) -> Result<(), MachineError> {
         loop {
-            let instruction = self.fetch();
+            match self.fetch() {
+                Ok(instruction) => {
+                    if let Err(e) = self.execute(instruction) {
+                        return Err(MachineError::Execution(e));
+                    }
+                }
+                Err(e) => {
+                    return Err(MachineError::Memory(e));
+                }
+            }
 
-            if let Err(e) = self.execute(instruction) {
-                return Err(e);
-            };
+            //let instruction = self.fetch();
         }
     }
 
-    fn fetch(&mut self) -> Instruction {
+    fn fetch(&mut self) -> Result<Instruction, MemoryError> {
         let data = u32::from_le_bytes([
-            self.memory.load((self.program_counter) + 0),
-            self.memory.load((self.program_counter) + 1),
-            self.memory.load((self.program_counter) + 2),
-            self.memory.load((self.program_counter) + 3),
+            self.memory.load((self.program_counter) + 0)?,
+            self.memory.load((self.program_counter) + 1)?,
+            self.memory.load((self.program_counter) + 2)?,
+            self.memory.load((self.program_counter) + 3)?,
         ]);
         self.program_counter += 4;
-        return Instruction::decode(data);
+        Ok(Instruction::decode(data))
     }
 
     fn read_register(&self, i: u8) -> u64 {
@@ -131,7 +109,10 @@ impl Machine {
             Instruction::LB { rs, rd, offset } => {
                 // rd ← s8[rs1 + offset]
                 let a = addiu(self.read_register(rs), i32::from(offset));
-                self.write_register(rd, i8::from_le_bytes(self.memory.load_array(a)) as u32 as u64);
+                self.write_register(
+                    rd,
+                    i8::from_le_bytes(self.memory.load_array(a).unwrap()) as u32 as u64,
+                );
                 Ok(())
             }
             Instruction::LH { rs, rd, offset } => {
@@ -139,38 +120,53 @@ impl Machine {
                 let a = addiu(self.read_register(rs), i32::from(offset));
                 self.write_register(
                     rd,
-                    u64::from(i16::from_le_bytes(self.memory.load_array(a)) as u32),
+                    u64::from(i16::from_le_bytes(self.memory.load_array(a).unwrap()) as u32),
                 );
                 Ok(())
             }
             Instruction::LW { rs, rd, offset } => {
                 // rd ← s32[rs1 + offset]
                 let a = addiu(self.read_register(rs), i32::from(offset));
-                self.write_register(rd, i32::from_le_bytes(self.memory.load_array(a)) as u64);
+                self.write_register(
+                    rd,
+                    i32::from_le_bytes(self.memory.load_array(a).unwrap()) as u64,
+                );
                 Ok(())
             }
             Instruction::LD { rs, rd, offset } => {
                 // rd ← u64[rs1 + offset]
                 let a = addiu(self.read_register(rs), i32::from(offset));
-                self.write_register(rd, i64::from_le_bytes(self.memory.load_array(a)) as u64);
+                self.write_register(
+                    rd,
+                    i64::from_le_bytes(self.memory.load_array(a).unwrap()) as u64,
+                );
                 Ok(())
             }
             Instruction::LBU { rs, rd, offset } => {
                 // rd ← u8[rs1 + offset]
                 let a = addiu(self.read_register(rs), i32::from(offset));
-                self.write_register(rd, u8::from_le_bytes(self.memory.load_array(a)) as u64);
+                self.write_register(
+                    rd,
+                    u8::from_le_bytes(self.memory.load_array(a).unwrap()) as u64,
+                );
                 Ok(())
             }
             Instruction::LHU { rs, rd, offset } => {
                 // rd ← u16[rs1 + offset]
                 let a = addiu(self.read_register(rs), i32::from(offset));
-                self.write_register(rd, u16::from_le_bytes(self.memory.load_array(a)) as u64);
+                self.write_register(
+                    rd,
+                    u16::from_le_bytes(self.memory.load_array(a).unwrap()) as u64,
+                );
                 Ok(())
             }
             Instruction::LWU { rs, rd, offset } => {
                 // rd ← u32[rs1 + offset]
                 let a = addiu(self.read_register(rs), i32::from(offset));
-                self.write_register(rd, u32::from_le_bytes(self.memory.load_array(a)) as u64);
+                self.write_register(
+                    rd,
+                    u32::from_le_bytes(self.memory.load_array(a).unwrap()) as u64,
+                );
                 Ok(())
             }
             Instruction::ADDI { rd, rs, imm } => {
@@ -400,25 +396,31 @@ impl Machine {
             Instruction::SB { rs1, rs2, offset } => {
                 // u8[rs1 + offset] ← rs2
                 let a = addiu(self.read_register(rs1), i32::from(offset));
-                self.memory.store_slice(a, &(self.read_register(rs2) as u8).to_le_bytes());
+                self.memory.store_slice(a, &(self.read_register(rs2) as u8).to_le_bytes()).unwrap();
                 Ok(())
             }
             Instruction::SH { rs1, rs2, offset } => {
                 // u16[rs1 + offset] ← rs2
                 let a = addiu(self.read_register(rs1), i32::from(offset));
-                self.memory.store_slice(a, &(self.read_register(rs2) as u16).to_le_bytes());
+                self.memory
+                    .store_slice(a, &(self.read_register(rs2) as u16).to_le_bytes())
+                    .unwrap();
                 Ok(())
             }
             Instruction::SW { rs1, rs2, offset } => {
                 // u32[rs1 + offset] ← rs2
                 let a = addiu(self.read_register(rs1), i32::from(offset));
-                self.memory.store_slice(a, &(self.read_register(rs2) as u32).to_le_bytes());
+                self.memory
+                    .store_slice(a, &(self.read_register(rs2) as u32).to_le_bytes())
+                    .unwrap();
                 Ok(())
             }
             Instruction::SD { rs1, rs2, offset } => {
                 // u64[rs1 + offset] ← rs2
                 let a = addiu(self.read_register(rs1), i32::from(offset));
-                self.memory.store_slice(a, &(self.read_register(rs2) as u64).to_le_bytes());
+                self.memory
+                    .store_slice(a, &(self.read_register(rs2) as u64).to_le_bytes())
+                    .unwrap();
                 Ok(())
             }
             Instruction::LUI { rd, imm } => {
@@ -510,10 +512,7 @@ impl Machine {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        instructions::Instruction,
-        types::{Address, Memory},
-    };
+    use crate::{instructions::Instruction, memory::Memory, types::Address};
 
     use super::Machine;
 
@@ -530,8 +529,9 @@ mod tests {
         fn t(x: u64, offset: i16) -> u64 {
             let mut m = Machine::new();
             let a: u64 = 0x1000;
+            let data = x.to_le_bytes();
+            m.memory.map_ro(a, &data);
             m.registers[10] = a as u64 - offset as u64;
-            m.memory.store_slice(a as Address, &x.to_le_bytes());
             assert!(m.execute(Instruction::LB { rs: 10, rd: 10, offset: offset }).is_ok());
             m.registers[10]
         }
@@ -542,8 +542,9 @@ mod tests {
         fn t(x: u64, offset: i16) -> u64 {
             let mut m = Machine::new();
             let a = 0x1000;
+            let data = x.to_le_bytes();
+            m.memory.map_ro(a, &data);
             m.registers[10] = a as u64 - offset as u64;
-            m.memory.store_slice(a as Address, &x.to_le_bytes());
             assert!(m.execute(Instruction::LH { rs: 10, rd: 10, offset: offset }).is_ok());
             m.registers[10]
         }
@@ -554,8 +555,9 @@ mod tests {
         fn t(x: u64, offset: i16) -> u64 {
             let mut m = Machine::new();
             let a = 0x1000;
+            let data = x.to_le_bytes();
+            m.memory.map_ro(a, &data);
             m.registers[10] = a as u64 - offset as u64;
-            m.memory.store_slice(a as Address, &x.to_le_bytes());
             assert!(m.execute(Instruction::LW { rs: 10, rd: 10, offset: offset }).is_ok());
             m.registers[10]
         }
@@ -564,10 +566,11 @@ mod tests {
     #[test]
     fn test_ld() {
         fn t(x: u64, offset: i16) -> u64 {
+            let data = x.to_le_bytes();
             let mut m = Machine::new();
             let a = 0x1000;
+            m.memory.map_ro(0x1000, &data);
             m.registers[10] = a as u64 - offset as u64;
-            m.memory.store_slice(a as Address, &x.to_le_bytes());
             assert!(m.execute(Instruction::LD { rs: 10, rd: 10, offset: offset }).is_ok());
             m.registers[10]
         }
@@ -578,8 +581,9 @@ mod tests {
         fn t(x: u64, offset: i16) -> u64 {
             let mut m = Machine::new();
             let a = 0x1000;
+            let data = x.to_le_bytes();
+            m.memory.map_ro(a, &data);
             m.registers[10] = a as u64 - offset as u64;
-            m.memory.store_slice(a as Address, &x.to_le_bytes());
             assert!(m.execute(Instruction::LBU { rs: 10, rd: 10, offset: offset }).is_ok());
             m.registers[10]
         }
@@ -590,8 +594,9 @@ mod tests {
         fn t(x: u64, offset: i16) -> u64 {
             let mut m = Machine::new();
             let a = 0x1000;
+            let data = x.to_le_bytes();
+            m.memory.map_ro(a, &data);
             m.registers[10] = a as u64 - offset as u64;
-            m.memory.store_slice(a as Address, &x.to_le_bytes());
             assert!(m.execute(Instruction::LHU { rs: 10, rd: 10, offset: offset }).is_ok());
             m.registers[10]
         }
@@ -602,8 +607,9 @@ mod tests {
         fn t(x: u64, offset: i16) -> u64 {
             let mut m = Machine::new();
             let a = 0x1000;
+            let data = x.to_le_bytes();
+            m.memory.map_ro(a, &data);
             m.registers[10] = a as u64 - offset as u64;
-            m.memory.store_slice(a as Address, &x.to_le_bytes());
             assert!(m.execute(Instruction::LWU { rs: 10, rd: 10, offset: offset }).is_ok());
             m.registers[10]
         }
@@ -755,6 +761,7 @@ mod tests {
             assert!(m.execute(Instruction::JALR { rd: 10, rs: 10, offset: i }).is_ok());
             (m.program_counter, m.registers[10])
         }
+        assert_eq!(t(100, 200, 16), (216, 100));
         //assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x2000, 7), (0x2007, 0xF7F6F5F4F3F2F1F4));
         //assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x2000, -6), (0x1FFA, 0xF7F6F5F4F3F2F1F4));
     }
@@ -943,10 +950,12 @@ mod tests {
     fn test_sb() {
         fn t(a: u64, b: u64, i: i16) -> [u8; 8] {
             let mut m = Machine::new();
+            let mut data = [0, 0, 0, 0, 0, 0, 0, 0];
+            m.memory.map(2000, &mut data);
             m.registers[10] = a as u64;
             m.registers[11] = b as u64;
             assert!(m.execute(Instruction::SB { rs1: 10, rs2: 11, offset: i }).is_ok());
-            m.memory.load_array(2000)
+            m.memory.load_array(2000).unwrap()
         }
 
         assert_eq!(t(2000, 0xA7A6A5A4A3A2A1A0, 0), [0xA0, 0, 0, 0, 0, 0, 0, 0])
@@ -954,11 +963,13 @@ mod tests {
     #[test]
     fn test_sh() {
         fn t(a: u64, b: u64, i: i16) -> [u8; 8] {
+            let mut data = [0, 0, 0, 0, 0, 0, 0, 0];
             let mut m = Machine::new();
+            m.memory.map(2000, &mut data);
             m.registers[10] = a as u64;
             m.registers[11] = b as u64;
             assert!(m.execute(Instruction::SH { rs1: 10, rs2: 11, offset: i }).is_ok());
-            m.memory.load_array(2000)
+            m.memory.load_array(2000).unwrap()
         }
 
         assert_eq!(t(2000, 0xA7A6A5A4A3A2A1A0, 0), [0xA0, 0xA1, 0, 0, 0, 0, 0, 0])
@@ -966,11 +977,13 @@ mod tests {
     #[test]
     fn test_sw() {
         fn t(a: u64, b: u64, i: i16) -> [u8; 8] {
+            let mut data = [0, 0, 0, 0, 0, 0, 0, 0];
             let mut m = Machine::new();
+            m.memory.map(2000, &mut data);
             m.registers[10] = a as u64;
             m.registers[11] = b as u64;
             assert!(m.execute(Instruction::SW { rs1: 10, rs2: 11, offset: i }).is_ok());
-            m.memory.load_array(2000)
+            m.memory.load_array(2000).unwrap()
         }
 
         assert_eq!(t(2000, 0xA7A6A5A4A3A2A1A0, 0), [0xA0, 0xA1, 0xA2, 0xA3, 0, 0, 0, 0])
@@ -978,11 +991,13 @@ mod tests {
     #[test]
     fn test_sd() {
         fn t(a: u64, b: u64, i: i16) -> [u8; 8] {
+            let mut data = [0, 0, 0, 0, 0, 0, 0, 0];
             let mut m = Machine::new();
+            m.memory.map(2000, &mut data);
             m.registers[10] = a as u64;
             m.registers[11] = b as u64;
             assert!(m.execute(Instruction::SD { rs1: 10, rs2: 11, offset: i }).is_ok());
-            m.memory.load_array(2000)
+            m.memory.load_array(2000).unwrap()
         }
 
         assert_eq!(t(2000, 0xA7A6A5A4A3A2A1A0, 0), [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7])
@@ -1140,8 +1155,7 @@ mod tests {
     #[test]
     fn test_program_multiply() {
         let program = [
-            // main:
-            Instruction::ADDI { rd: 10, rs: 0, imm: 7 }, // a = 7
+            Instruction::ADDI { rd: 10, rs: 0, imm: 7 }, // main: a = 7
             Instruction::ADDI { rd: 11, rs: 0, imm: 8 }, // b = 8
             Instruction::AUIPC { rd: 6, offset: 0 },     //
             Instruction::JALR { rd: 1, rs: 6, offset: 2 * 4 }, // a = mul(a,b)
@@ -1165,8 +1179,8 @@ mod tests {
             memory_bytes
         };
 
-        let mut m = Machine::new_with_memory(memory_bytes);
-        assert!(m.run().is_err()); // Program should with 'error: instruction EBREAK not implemented'
+        let mut m = Machine::new_with_program(&memory_bytes);
+        assert!(m.run().is_err()); // Program termnates with 'error: instruction EBREAK not implemented'
         assert_eq!(m.registers[10], 0x38);
         assert_eq!(m.program_counter, 0x14);
     }

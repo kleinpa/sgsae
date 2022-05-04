@@ -1,7 +1,5 @@
 extern crate sgsae;
 
-use std::fs::File;
-
 use sgsae::instructions::Instruction;
 use sgsae::machine::Machine;
 
@@ -21,24 +19,20 @@ fn main() -> Result<(), std::io::Error> {
         Instruction::JALR { rd: 0, rs: 1, offset: 0 }, // return
     ];
 
-    let default_bin = {
-        let mut default_bin = Vec::new();
-        for instruction in program {
-            default_bin.extend(instruction.encode().to_le_bytes());
-        }
-        default_bin
-    };
-
     let memory_bytes = {
         let mut memory_bytes = [0; 65536];
-
-        memory_bytes[..default_bin.len()].copy_from_slice(default_bin.as_slice());
+        let mut i = 0;
+        for instruction in program {
+            let code = instruction.encode().to_le_bytes();
+            memory_bytes[i..i + code.len()].copy_from_slice(&code);
+            i = i + code.len();
+        }
         memory_bytes
     };
 
-    let mut m = Machine::new_with_memory(memory_bytes);
+    let mut m = Machine::new_with_program(&memory_bytes);
     if let Err(e) = m.run() {
-        eprintln!("error: {}", e)
+        eprintln!("error: {:?}", e)
     }
     println!("registers: {:#018X?}", m.get_registers());
 

@@ -6,6 +6,7 @@ rust_library(
         "instructions.rs",
         "lib.rs",
         "machine.rs",
+        "memory.rs",
         "types.rs",
     ],
     crate_name = "sgsae",
