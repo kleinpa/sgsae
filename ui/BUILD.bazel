@@ -1,0 +1,17 @@
+load("@rules_rust//wasm_bindgen:defs.bzl", "rust_wasm_bindgen")
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+# load("@rules_rust//rust:defs.bzl", "rust_shared_library")
+
+rust_binary(
+    name = "app",
+    srcs = ["app.rs"],
+    deps = [
+        "//sgsae",
+    ],
+)
+
+# rust_wasm_bindgen(
+#     name = "wasm",
+#     target = "web",
+#     wasm_file = ":app",
+# )
