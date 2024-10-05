@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "vite": "^5.4.8"
+  },
+  "type": "module",
+  "pnpm": {
+    "onlyBuiltDependencies": []
+  }
+}

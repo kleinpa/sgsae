@@ -1,17 +1,56 @@
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@npm//:defs.bzl", "npm_link_all_packages")
+load("@npm//ui:vite/package_json.bzl", vite_bin = "bin")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_shared_library")
 load("@rules_rust//wasm_bindgen:defs.bzl", "rust_wasm_bindgen")
-load("@rules_rust//rust:defs.bzl", "rust_binary")
-# load("@rules_rust//rust:defs.bzl", "rust_shared_library")
 
-rust_binary(
+npm_link_all_packages(name = "node_modules")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_shared_library(
     name = "app",
     srcs = ["app.rs"],
+    edition = "2018",
     deps = [
         "//sgsae",
+        "@rules_rust//wasm_bindgen/3rdparty:wasm_bindgen",
     ],
 )
 
-# rust_wasm_bindgen(
-#     name = "wasm",
-#     target = "web",
-#     wasm_file = ":app",
-# )
+rust_wasm_bindgen(
+    name = "app_bindgen",
+    target = "web",
+    wasm_file = ":app",
+)
+
+SRCS = [
+    "main.js",
+    "index.html",
+    ":app_bindgen",
+]
+
+BUILD_DEPS = [
+    "//ui:node_modules/vite",
+]
+
+vite_bin.vite(
+    name = "build",
+    srcs = SRCS + BUILD_DEPS,
+    args = ["build"],
+    chdir = package_name(),
+    out_dirs = ["dist"],
+)
+
+vite_bin.vite_binary(
+    name = "vite",
+    chdir = package_name(),
+    data = SRCS + BUILD_DEPS,
+)
+
+build_test(
+    name = "build_test",
+    targets = [
+        ":build",
+    ],
+)

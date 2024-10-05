@@ -1,4 +1,7 @@
 bazel_dep(name = "rules_rust", version = "0.52.0")
+bazel_dep(name = "aspect_rules_js", version = "2.0.2")
+bazel_dep(name = "bazel_skylib", version = "1.7.1")
+bazel_dep(name = "rules_cc", version = "0.0.10")
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
@@ -18,3 +21,17 @@ crate.from_cargo(
     manifests = ["//:Cargo.toml"],
 )
 use_repo(crate, "crates")
+
+register_toolchains("@rules_rust//wasm_bindgen:default_wasm_bindgen_toolchain")
+
+register_toolchains("@rules_rust//rust/private/dummy_cc_toolchain:dummy_cc_wasm32_toolchain")
+
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm", dev_dependency = True)
+
+npm.npm_translate_lock(
+    name = "npm",
+    pnpm_lock = "//ui:pnpm-lock.yaml",
+    verify_node_modules_ignored = "//:.bazelignore",
+)
+
+use_repo(npm, "npm")
