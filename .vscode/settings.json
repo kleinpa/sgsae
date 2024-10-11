@@ -1,9 +1,13 @@
 {
   "files.insertFinalNewline": true,
   "editor.formatOnSave": true,
+  "editor.codeActionsOnSave": {
+    "source.fixAll": "explicit"
+  },
   "files.trimTrailingWhitespace": true,
   "[markdown]": {
     "editor.wordWrap": "bounded",
     "editor.wordWrapColumn": 80
-  }
+  },
+  "editor.defaultFormatter": "esbenp.prettier-vscode"
 }

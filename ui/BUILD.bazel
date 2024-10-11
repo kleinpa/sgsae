@@ -6,8 +6,6 @@ load("@rules_rust//wasm_bindgen:defs.bzl", "rust_wasm_bindgen")
 
 npm_link_all_packages(name = "node_modules")
 
-package(default_visibility = ["//visibility:public"])
-
 rust_shared_library(
     name = "app",
     srcs = ["app.rs"],
@@ -25,13 +23,18 @@ rust_wasm_bindgen(
 )
 
 SRCS = [
-    "main.js",
     "index.html",
-    ":app_bindgen",
+    "package.json",
+    "vite.config.js",
+    "//ui/src",
+    ":app_bindgen"
 ]
 
 BUILD_DEPS = [
+    "//ui:node_modules/@vitejs/plugin-vue",
     "//ui:node_modules/vite",
+    "//ui:node_modules/vue",
+    "//ui:node_modules/vue-router",
 ]
 
 vite_bin.vite(
