@@ -1,8 +1,4 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["github>kleinpa/renovate-config"],
-  "automerge": true,
-  "automergeType": "branch",
-  "branchConcurrentLimit": 0,
-  "dependencyDashboard": true
+  "extends": ["github>kleinpa/renovate-config"]
 }
