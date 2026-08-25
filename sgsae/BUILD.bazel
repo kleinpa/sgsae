@@ -3,13 +3,27 @@ load("@rules_rust//rust:defs.bzl", "rust_doc", "rust_library", "rust_test")
 rust_library(
     name = "sgsae",
     srcs = [
+        "apu.rs",
+        "compressed.rs",
+        "console.rs",
+        "devices.rs",
+        "elf.rs",
+        "input.rs",
         "instructions.rs",
+        "loader.rs",
         "lib.rs",
         "machine.rs",
         "memory.rs",
+        "midi.rs",
+        "ppu.rs",
         "types.rs",
     ],
     crate_name = "sgsae",
+    # An interpreter is unusable unoptimised: the guest runs about ten times
+    # slower, which in the browser means audio cannot be produced fast enough
+    # to play without gaps. Pinned here rather than left to -c so that a plain
+    # `bazel run //ui:vite` is playable.
+    rustc_flags = ["-Copt-level=2"],
     visibility = ["//visibility:public"],
 )
 

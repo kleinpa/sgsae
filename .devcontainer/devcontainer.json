@@ -1,7 +1,12 @@
 {
   "image": "mcr.microsoft.com/devcontainers/universal:5",
   "features": {
-    "ghcr.io/devcontainers-community/features/bazel:1": {}
+    "ghcr.io/devcontainers-community/features/bazel:1": {},
+    "ghcr.io/kreemer/features/chrometesting:1": {}
+  },
+  "containerEnv": {
+    "CHROME_BIN": "/usr/local/bin/chrome",
+    "CHROMEDRIVER_BIN": "/usr/local/bin/chromedriver"
   },
   "customizations": {
     "vscode": {

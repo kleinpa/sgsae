@@ -1,9 +1,12 @@
 {
   "dependencies": {
-    "vite": "^7.0.0"
+    "vite": "^8.2.2"
   },
   "type": "module",
   "pnpm": {
     "onlyBuiltDependencies": []
+  },
+  "devDependencies": {
+    "selenium-webdriver": "^4.47.0"
   }
 }

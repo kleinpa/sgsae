@@ -1,6 +1,35 @@
 <html>
   <head>
     <title>sgsae</title>
+    <style>
+      :root { color-scheme: dark; }
+      html, body { height: 100%; }
+      body {
+        margin: 0;
+        background: #2a2a2d;
+        display: grid;
+        place-items: center;
+        overflow: hidden;
+      }
+      canvas {
+        display: block;
+        background: #000;
+        /* The GPU does the magnification; this only matters on the 2D fallback. */
+        image-rendering: pixelated;
+      }
+      /* Only ever shown when something has gone wrong. */
+      #emulator-output {
+        position: fixed;
+        inset: auto 0 0 0;
+        margin: 0;
+        padding: 6px 10px;
+        font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: #ff8a80;
+        background: #1b1b1e;
+        white-space: pre-wrap;
+      }
+      #emulator-output:empty { display: none; }
+    </style>
   </head>
   <body>
     <script type="module" src="main.js"></script>

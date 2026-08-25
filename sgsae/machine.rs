@@ -1,1187 +1,820 @@
-use std::error::Error;
+//! The RV32IM interpreter.
+//!
+//! The machine owns a [`Bus`] and 32 registers, and runs in cycle-budgeted
+//! slices so a host can drive it from a frame loop:
+//!
+//! ```no_run
+//! # use sgsae::machine::{Machine, Trap};
+//! # use sgsae::memory::Bus;
+//! # let mut machine = Machine::new(Bus::new());
+//! # const CYCLES_PER_FRAME: u64 = 280_000;
+//! loop {
+//!     match machine.run(CYCLES_PER_FRAME) {
+//!         Ok(()) => break,                             // frame done, yield to the host
+//!         Err(Trap::EnvironmentCall { .. }) => {
+//!             // …service the call and keep going; the ECALL has retired.
+//!         }
+//!         Err(other) => panic!("{other}"),
+//!     }
+//! }
+//! ```
+//!
+//! Nothing in here panics on guest behaviour. A bad address, a misaligned
+//! jump, or an unrecognised opcode all come back as a [`Trap`], which is what
+//! lets a host show a fault screen instead of taking the page down with it.
+
 use std::fmt;
 
+use crate::compressed;
 use crate::instructions::Instruction;
-use crate::memory::{Memory, MemoryError, MemoryMap};
-use crate::types::ProgramCounter;
+use crate::memory::{Bus, Fault, Width};
+use crate::types::{Address, Register, Word};
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct ExecutionError {
-    details: String,
+/// An abnormal condition that stopped execution.
+///
+/// Every variant carries the address of the instruction responsible. `ECALL`
+/// and `EBREAK` are traps too — that is the seam a host uses for syscalls and
+/// breakpoints.
+///
+/// A fault leaves `pc` on the instruction that caused it. `ECALL` is a call,
+/// not a fault, so it is the one trap that retires: `pc` has already moved on
+/// and the host just calls [`Machine::run`] again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Trap {
+    /// The word at `pc` is not a valid RV32IM encoding.
+    IllegalInstruction { pc: Address, word: Word },
+    /// There is no memory at `pc`.
+    FetchFault { pc: Address },
+    /// `pc` is not 2-byte aligned.
+    MisalignedFetch { pc: Address },
+    /// A branch or jump targeted a misaligned address.
+    MisalignedJump { pc: Address, target: Address },
+    /// A load failed.
+    LoadFault { pc: Address, addr: Address, cause: Fault },
+    /// A store failed.
+    StoreFault { pc: Address, addr: Address, cause: Fault },
+    /// The guest executed `ECALL`.
+    EnvironmentCall { pc: Address },
+    /// The guest executed `EBREAK`.
+    Breakpoint { pc: Address },
+    /// The guest touched a CSR. No control and status registers are
+    /// implemented.
+    UnsupportedCsr { pc: Address, csr: u16 },
 }
 
-impl ExecutionError {
-    fn new(msg: &str) -> ExecutionError {
-        ExecutionError { details: msg.to_string() }
-    }
-}
-
-impl fmt::Display for ExecutionError {
+impl fmt::Display for Trap {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.details)
-    }
-}
-
-impl Error for ExecutionError {
-    fn description(&self) -> &str {
-        &self.details
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum MachineError {
-    Execution(ExecutionError),
-    Memory(MemoryError),
-}
-
-pub struct Machine<'a> {
-    program_counter: ProgramCounter,
-    registers: [u64; 32],
-    memory: MemoryMap<'a>,
-}
-
-impl<'a> Machine<'a> {
-    pub fn new() -> Machine<'a> {
-        Machine { program_counter: 0, registers: [0; 32], memory: MemoryMap::new() }
-    }
-
-    pub fn new_with_program(program: &'a [u8]) -> Machine<'a> {
-        let mut machine = Machine::new();
-        machine.memory.map_ro(0, program);
-        machine
-    }
-
-    pub fn get_registers(&self) -> [u64; 32] {
-        self.registers
-    }
-
-    pub fn run(&mut self) -> Result<(), MachineError> {
-        loop {
-            match self.fetch() {
-                Ok(instruction) => {
-                    if let Err(e) = self.execute(instruction) {
-                        return Err(MachineError::Execution(e));
-                    }
-                }
-                Err(e) => {
-                    return Err(MachineError::Memory(e));
-                }
+        match self {
+            Trap::IllegalInstruction { pc, word } => {
+                write!(f, "illegal instruction {word:#010x} at {pc:#010x}")
             }
+            Trap::FetchFault { pc } => write!(f, "fetch from unmapped {pc:#010x}"),
+            Trap::MisalignedFetch { pc } => write!(f, "misaligned fetch at {pc:#010x}"),
+            Trap::MisalignedJump { pc, target } => {
+                write!(f, "jump at {pc:#010x} to misaligned {target:#010x}")
+            }
+            Trap::LoadFault { pc, cause, .. } => write!(f, "load at {pc:#010x}: {cause}"),
+            Trap::StoreFault { pc, cause, .. } => write!(f, "store at {pc:#010x}: {cause}"),
+            Trap::EnvironmentCall { pc } => write!(f, "ecall at {pc:#010x}"),
+            Trap::Breakpoint { pc } => write!(f, "ebreak at {pc:#010x}"),
+            Trap::UnsupportedCsr { pc, csr } => {
+                write!(f, "unsupported csr {csr:#05x} at {pc:#010x}")
+            }
+        }
+    }
+}
 
-            //let instruction = self.fetch();
+impl std::error::Error for Trap {}
+
+/// An RV32IM hart and the bus it is attached to.
+pub struct Machine {
+    pc: Address,
+    /// Register 0 is never written, so it always reads as zero.
+    registers: [Word; 32],
+    bus: Bus,
+    cycles: u64,
+}
+
+impl Machine {
+    /// Create a machine attached to `bus`, with `pc` at 0 and all registers zero.
+    pub fn new(bus: Bus) -> Machine {
+        Machine { pc: 0, registers: [0; 32], bus, cycles: 0 }
+    }
+
+    // -- host inspection -----------------------------------------------------
+
+    pub fn pc(&self) -> Address {
+        self.pc
+    }
+
+    pub fn set_pc(&mut self, pc: Address) {
+        self.pc = pc;
+    }
+
+    pub fn registers(&self) -> &[Word; 32] {
+        &self.registers
+    }
+
+    /// Read register `i`. Register 0 always reads as zero.
+    pub fn register(&self, i: Register) -> Word {
+        self.registers[usize::from(i)]
+    }
+
+    /// Write register `i`. Writes to register 0 are discarded.
+    pub fn set_register(&mut self, i: Register, value: Word) {
+        if i != 0 {
+            self.registers[usize::from(i)] = value;
         }
     }
 
-    fn fetch(&mut self) -> Result<Instruction, MemoryError> {
-        let data = u32::from_le_bytes([
-            self.memory.load((self.program_counter) + 0)?,
-            self.memory.load((self.program_counter) + 1)?,
-            self.memory.load((self.program_counter) + 2)?,
-            self.memory.load((self.program_counter) + 3)?,
-        ]);
-        self.program_counter += 4;
-        Ok(Instruction::decode(data))
+    /// Clear every register, as a reset would.
+    ///
+    /// A program starting up is entitled to assume nothing about what the last
+    /// one left behind.
+    pub fn reset_registers(&mut self) {
+        self.registers = [0; 32];
     }
 
-    fn read_register(&self, i: u8) -> u64 {
-        if i == 0 {
-            0
+    /// Instructions retired since the machine was created.
+    pub fn cycles(&self) -> u64 {
+        self.cycles
+    }
+
+    pub fn bus(&self) -> &Bus {
+        &self.bus
+    }
+
+    pub fn bus_mut(&mut self) -> &mut Bus {
+        &mut self.bus
+    }
+
+    // -- execution -----------------------------------------------------------
+
+    /// Run until the machine traps or `budget` instructions have retired.
+    ///
+    /// `Ok` means the budget was spent; call again to continue.
+    pub fn run(&mut self, budget: u64) -> Result<(), Trap> {
+        for _ in 0..budget {
+            self.step()?;
+        }
+        Ok(())
+    }
+
+    /// Fetch, decode, and execute one instruction.
+    pub fn step(&mut self) -> Result<(), Trap> {
+        let (instruction, width) = self.fetch()?;
+        self.pc = self.execute_width(instruction, width)?;
+        self.cycles += 1;
+        Ok(())
+    }
+
+    /// Read the instruction at `pc`, returning it and how many bytes it took.
+    ///
+    /// Instructions are 4 bytes unless the first halfword marks them
+    /// compressed, in which case they are 2 — so a 2-byte instruction at the
+    /// very end of memory does not fault.
+    fn fetch(&self) -> Result<(Instruction, u32), Trap> {
+        let pc = self.pc;
+        if pc % 2 != 0 {
+            return Err(Trap::MisalignedFetch { pc });
+        }
+        let fault = || Trap::FetchFault { pc };
+        let bytes = self.bus.bytes_at(pc).ok_or_else(fault)?;
+        let &[a, b, ..] = bytes else { return Err(fault()) };
+        let low = u16::from_le_bytes([a, b]);
+        if compressed::is_compressed(low) {
+            return Ok((compressed::decode(low), 2));
+        }
+        let &[_, _, c, d, ..] = bytes else { return Err(fault()) };
+        Ok((Instruction::decode(u32::from_le_bytes([a, b, c, d])), 4))
+    }
+
+    /// Address for a load or store: `rs1 + offset`, wrapping.
+    fn effective_address(&self, rs1: Register, offset: i32) -> Address {
+        self.register(rs1).wrapping_add(offset as u32)
+    }
+
+    /// Load through `extend`, which turns the zero-extended bus value into
+    /// the register value — the signed loads sign-extend from their own width.
+    fn ld(
+        &mut self,
+        rd: Register,
+        rs1: Register,
+        offset: i32,
+        width: Width,
+        extend: impl Fn(u32) -> u32,
+    ) -> Result<(), Trap> {
+        let addr = self.effective_address(rs1, offset);
+        let pc = self.pc;
+        let v = self.bus.read(addr, width).map_err(|cause| Trap::LoadFault { pc, addr, cause })?;
+        self.set_register(rd, extend(v));
+        Ok(())
+    }
+
+    fn st(&mut self, rs1: Register, rs2: Register, offset: i32, width: Width) -> Result<(), Trap> {
+        let addr = self.effective_address(rs1, offset);
+        let pc = self.pc;
+        self.bus
+            .write(addr, width, self.register(rs2))
+            .map_err(|cause| Trap::StoreFault { pc, addr, cause })
+    }
+
+    /// `rd = f(rs1, rs2)`.
+    fn rr(&mut self, rd: Register, rs1: Register, rs2: Register, f: impl Fn(u32, u32) -> u32) {
+        self.set_register(rd, f(self.register(rs1), self.register(rs2)));
+    }
+
+    /// `rd = f(rs1, imm)`, with the sign-extended immediate as a `u32`.
+    fn ri(&mut self, rd: Register, rs1: Register, imm: i32, f: impl Fn(u32, u32) -> u32) {
+        self.set_register(rd, f(self.register(rs1), imm as u32));
+    }
+
+    /// Next `pc` after a branch: `pc + offset` if `taken(rs1, rs2)`, else `next`.
+    fn br(
+        &self,
+        next: Address,
+        rs1: Register,
+        rs2: Register,
+        offset: i32,
+        taken: impl Fn(u32, u32) -> bool,
+    ) -> Result<Address, Trap> {
+        if taken(self.register(rs1), self.register(rs2)) {
+            self.aligned(self.pc.wrapping_add(offset as u32))
         } else {
-            self.registers[usize::from(i)]
+            Ok(next)
         }
-    }
-    fn write_register(&mut self, i: u8, x: u64) {
-        if i == 0 {
-            return;
-        }
-        let x: u64 = x.into();
-        self.registers[usize::from(i)] = x;
     }
 
-    fn execute(&mut self, instruction: Instruction) -> Result<(), ExecutionError> {
-        /// Add a signed
-        fn addiu(a: u64, b: i32) -> u64 {
-            a.wrapping_add(b as u64)
+    /// A control-transfer target, rejecting a misaligned one at the jump
+    /// itself. With compressed instructions in play only an odd target is out.
+    fn aligned(&self, target: Address) -> Result<Address, Trap> {
+        if target % 2 != 0 {
+            return Err(Trap::MisalignedJump { pc: self.pc, target });
         }
-        // execute
-        #[allow(unused_variables)]
+        Ok(target)
+    }
+
+    /// Execute one already-decoded 4-byte instruction against the current
+    /// `pc`, without advancing it.
+    ///
+    /// Call [`Machine::step`] for the normal fetch-execute cycle — this is
+    /// exposed for tests and for hosts that want to inject an instruction.
+    pub fn execute(&mut self, instruction: Instruction) -> Result<(), Trap> {
+        self.execute_width(instruction, 4).map(|_| ())
+    }
+
+    /// Execute one instruction of `width` bytes, returning the next `pc`.
+    #[rustfmt::skip]
+    fn execute_width(&mut self, instruction: Instruction, width: u32) -> Result<Address, Trap> {
+        use Instruction as I;
+        let pc = self.pc;
+        let next = pc.wrapping_add(width);
+
         match instruction {
-            Instruction::LB { rs, rd, offset } => {
-                // rd ← s8[rs1 + offset]
-                let a = addiu(self.read_register(rs), i32::from(offset));
-                self.write_register(
-                    rd,
-                    i8::from_le_bytes(self.memory.load_array(a).unwrap()) as u32 as u64,
-                );
-                Ok(())
+            // -- upper immediates and jumps --------------------------------
+            I::LUI { rd, imm } => self.set_register(rd, imm as u32),
+            I::AUIPC { rd, imm } => self.set_register(rd, pc.wrapping_add(imm as u32)),
+            I::JAL { rd, offset } => {
+                let target = self.aligned(pc.wrapping_add(offset as u32))?;
+                self.set_register(rd, next);
+                return Ok(target);
             }
-            Instruction::LH { rs, rd, offset } => {
-                // rd ← s16[rs1 + offset]
-                let a = addiu(self.read_register(rs), i32::from(offset));
-                self.write_register(
-                    rd,
-                    u64::from(i16::from_le_bytes(self.memory.load_array(a).unwrap()) as u32),
-                );
-                Ok(())
+            I::JALR { rd, rs1, offset } => {
+                // The spec clears the low bit of the computed target.
+                let target = self.aligned(self.effective_address(rs1, offset) & !1)?;
+                self.set_register(rd, next);
+                return Ok(target);
             }
-            Instruction::LW { rs, rd, offset } => {
-                // rd ← s32[rs1 + offset]
-                let a = addiu(self.read_register(rs), i32::from(offset));
-                self.write_register(
-                    rd,
-                    i32::from_le_bytes(self.memory.load_array(a).unwrap()) as u64,
-                );
-                Ok(())
+
+            // -- branches --------------------------------------------------
+            I::BEQ  { rs1, rs2, offset } => return self.br(next, rs1, rs2, offset, |a, b| a == b),
+            I::BNE  { rs1, rs2, offset } => return self.br(next, rs1, rs2, offset, |a, b| a != b),
+            I::BLT  { rs1, rs2, offset } => return self.br(next, rs1, rs2, offset, |a, b| (a as i32) < (b as i32)),
+            I::BGE  { rs1, rs2, offset } => return self.br(next, rs1, rs2, offset, |a, b| (a as i32) >= (b as i32)),
+            I::BLTU { rs1, rs2, offset } => return self.br(next, rs1, rs2, offset, |a, b| a < b),
+            I::BGEU { rs1, rs2, offset } => return self.br(next, rs1, rs2, offset, |a, b| a >= b),
+
+            // -- loads and stores ------------------------------------------
+            I::LB  { rd, rs1, offset } => self.ld(rd, rs1, offset, Width::Byte, |v| v as u8 as i8 as i32 as u32)?,
+            I::LH  { rd, rs1, offset } => self.ld(rd, rs1, offset, Width::Half, |v| v as u16 as i16 as i32 as u32)?,
+            I::LW  { rd, rs1, offset } => self.ld(rd, rs1, offset, Width::Word, |v| v)?,
+            I::LBU { rd, rs1, offset } => self.ld(rd, rs1, offset, Width::Byte, |v| v)?,
+            I::LHU { rd, rs1, offset } => self.ld(rd, rs1, offset, Width::Half, |v| v)?,
+            I::SB  { rs1, rs2, offset } => self.st(rs1, rs2, offset, Width::Byte)?,
+            I::SH  { rs1, rs2, offset } => self.st(rs1, rs2, offset, Width::Half)?,
+            I::SW  { rs1, rs2, offset } => self.st(rs1, rs2, offset, Width::Word)?,
+
+            // -- register-immediate ----------------------------------------
+            // Every immediate arrives sign-extended from the decoder, so the
+            // bitwise ops get the full-width value the spec calls for. Shift
+            // amounts use only their low five bits.
+            I::ADDI  { rd, rs1, imm } => self.ri(rd, rs1, imm, u32::wrapping_add),
+            I::SLTI  { rd, rs1, imm } => self.ri(rd, rs1, imm, |a, b| ((a as i32) < (b as i32)) as u32),
+            I::SLTIU { rd, rs1, imm } => self.ri(rd, rs1, imm, |a, b| (a < b) as u32),
+            I::XORI  { rd, rs1, imm } => self.ri(rd, rs1, imm, |a, b| a ^ b),
+            I::ORI   { rd, rs1, imm } => self.ri(rd, rs1, imm, |a, b| a | b),
+            I::ANDI  { rd, rs1, imm } => self.ri(rd, rs1, imm, |a, b| a & b),
+            I::SLLI  { rd, rs1, shamt } => self.ri(rd, rs1, shamt as i32, |a, b| a << (b & 31)),
+            I::SRLI  { rd, rs1, shamt } => self.ri(rd, rs1, shamt as i32, |a, b| a >> (b & 31)),
+            I::SRAI  { rd, rs1, shamt } => self.ri(rd, rs1, shamt as i32, |a, b| ((a as i32) >> (b & 31)) as u32),
+
+            // -- register-register -----------------------------------------
+            I::ADD  { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, u32::wrapping_add),
+            I::SUB  { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, u32::wrapping_sub),
+            I::SLL  { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, |a, b| a << (b & 31)),
+            I::SLT  { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, |a, b| ((a as i32) < (b as i32)) as u32),
+            I::SLTU { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, |a, b| (a < b) as u32),
+            I::XOR  { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, |a, b| a ^ b),
+            I::SRL  { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, |a, b| a >> (b & 31)),
+            I::SRA  { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, |a, b| ((a as i32) >> (b & 31)) as u32),
+            I::OR   { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, |a, b| a | b),
+            I::AND  { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, |a, b| a & b),
+
+            // -- M extension -----------------------------------------------
+            // Division never traps on RV32M. The spec fixes divide-by-zero to
+            // all-ones / the dividend, and the one signed overflow case
+            // (MIN / -1) to MIN / 0 — which is what the wrapping ops give.
+            I::MUL    { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, u32::wrapping_mul),
+            I::MULH   { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, |a, b| ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32),
+            I::MULHSU { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, |a, b| ((i64::from(a as i32) * i64::from(b)) >> 32) as u32),
+            I::MULHU  { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, |a, b| ((u64::from(a) * u64::from(b)) >> 32) as u32),
+            I::DIV    { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, |a, b| if b == 0 { u32::MAX } else { (a as i32).wrapping_div(b as i32) as u32 }),
+            I::DIVU   { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, |a, b| if b == 0 { u32::MAX } else { a / b }),
+            I::REM    { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, |a, b| if b == 0 { a } else { (a as i32).wrapping_rem(b as i32) as u32 }),
+            I::REMU   { rd, rs1, rs2 } => self.rr(rd, rs1, rs2, |a, b| if b == 0 { a } else { a % b }),
+
+            // -- ordering and system ---------------------------------------
+            // Nothing is reordered or cached, so both fences retire as no-ops.
+            I::FENCE { .. } | I::FENCEI => {}
+
+            I::ECALL => {
+                self.pc = next;
+                return Err(Trap::EnvironmentCall { pc });
             }
-            Instruction::LD { rs, rd, offset } => {
-                // rd ← u64[rs1 + offset]
-                let a = addiu(self.read_register(rs), i32::from(offset));
-                self.write_register(
-                    rd,
-                    i64::from_le_bytes(self.memory.load_array(a).unwrap()) as u64,
-                );
-                Ok(())
+            I::EBREAK => return Err(Trap::Breakpoint { pc }),
+
+            I::CSRRW { csr, .. } | I::CSRRS { csr, .. } | I::CSRRC { csr, .. }
+            | I::CSRRWI { csr, .. } | I::CSRRSI { csr, .. } | I::CSRRCI { csr, .. } => {
+                return Err(Trap::UnsupportedCsr { pc, csr })
             }
-            Instruction::LBU { rs, rd, offset } => {
-                // rd ← u8[rs1 + offset]
-                let a = addiu(self.read_register(rs), i32::from(offset));
-                self.write_register(
-                    rd,
-                    u8::from_le_bytes(self.memory.load_array(a).unwrap()) as u64,
-                );
-                Ok(())
-            }
-            Instruction::LHU { rs, rd, offset } => {
-                // rd ← u16[rs1 + offset]
-                let a = addiu(self.read_register(rs), i32::from(offset));
-                self.write_register(
-                    rd,
-                    u16::from_le_bytes(self.memory.load_array(a).unwrap()) as u64,
-                );
-                Ok(())
-            }
-            Instruction::LWU { rs, rd, offset } => {
-                // rd ← u32[rs1 + offset]
-                let a = addiu(self.read_register(rs), i32::from(offset));
-                self.write_register(
-                    rd,
-                    u32::from_le_bytes(self.memory.load_array(a).unwrap()) as u64,
-                );
-                Ok(())
-            }
-            Instruction::ADDI { rd, rs, imm } => {
-                // rd ← rs1 + sx(imm)
-                self.write_register(rd, addiu(self.read_register(rs), i32::from(imm)));
-                Ok(())
-            }
-            Instruction::SLTI { rd, rs, imm } => {
-                // rd ← sx(rs1) < sx(imm)
-                self.write_register(
-                    rd,
-                    if (self.read_register(rs) as i64) < i64::from(imm) { 1 } else { 0 },
-                );
-                Ok(())
-            }
-            Instruction::SLTIU { rd, rs, imm } => {
-                // rd ← ux(rs1) < ux(imm)
-                self.write_register(
-                    rd,
-                    if self.read_register(rs) < u64::from(imm) { 1 } else { 0 },
-                );
-                Ok(())
-            }
-            Instruction::XORI { rd, rs, imm } => {
-                // rd ← ux(rs1) ⊕ ux(imm)
-                self.write_register(rd, self.read_register(rs) ^ u64::from(imm));
-                Ok(())
-            }
-            Instruction::ORI { rd, rs, imm } => {
-                // rd ← ux(rs1) ∨ ux(imm)
-                self.write_register(rd, self.read_register(rs) | u64::from(imm));
-                Ok(())
-            }
-            Instruction::ANDI { rd, rs, imm } => {
-                // rd ← ux(rs1) ∧ ux(imm)
-                self.write_register(rd, self.read_register(rs) & u64::from(imm));
-                Ok(())
-            }
-            Instruction::SLLI { rd, rs, imm } => {
-                // rd ← ux(rs1) « ux(imm)
-                self.write_register(rd, self.read_register(rs).wrapping_shl(u32::from(imm)));
-                Ok(())
-            }
-            Instruction::SRLI { rd, rs, imm } => {
-                // rd ← ux(rs1) » ux(imm)
-                self.write_register(rd, self.read_register(rs).wrapping_shr(u32::from(imm)));
-                Ok(())
-            }
-            Instruction::SRAI { rd, rs, imm } => {
-                // rd ← sx(rs1) » ux(imm)
-                self.write_register(
-                    rd,
-                    (self.read_register(rs) as i64).wrapping_shr(u32::from(imm)) as u64,
-                );
-                Ok(())
-            }
-            Instruction::ADDIW { rd, rs, imm } => {
-                // rd ← s32(rs1) + imm
-                self.write_register(
-                    rd,
-                    (self.read_register(rs) as i32).wrapping_add(i32::from(imm)) as u64,
-                );
-                Ok(())
-            }
-            Instruction::SLLIW { rd, rs, imm } => {
-                // rd ← s32(u32(rs1) « imm)
-                self.write_register(
-                    rd,
-                    (self.read_register(rs) as i32).wrapping_shl(u32::from(imm)) as u32 as u64,
-                );
-                Ok(())
-            }
-            Instruction::SRLIW { rd, rs, imm } => {
-                // rd ← s32(u32(rs1) » imm)
-                self.write_register(
-                    rd,
-                    u64::from((self.read_register(rs) as u32).wrapping_shr(u32::from(imm)) as u32),
-                );
-                Ok(())
-            }
-            Instruction::SRAIW { rd, rs, imm } => {
-                // rd ← s32(rs1) » imm
-                self.write_register(
-                    rd,
-                    u64::from((self.read_register(rs) as i32).wrapping_shr(u32::from(imm)) as u32),
-                );
-                Ok(())
-            }
-            Instruction::JALR { rd, rs, offset } => {
-                // rd ← pc + length(inst), pc ← (rs1 + offset) ∧ -2
-                // increment has already happened, no need to add
-                let ret = self.program_counter;
-                self.program_counter = addiu(self.read_register(rs), i32::from(offset));
-                self.write_register(rd, ret);
-                Ok(())
-            }
-            Instruction::JAL { rd, offset } => {
-                // rd ← pc + length(inst), pc ← pc + offset
-                self.write_register(rd, self.program_counter.wrapping_add(4));
-                self.program_counter = addiu(self.program_counter, offset);
-                Ok(())
-            }
-            Instruction::ADD { rd, rs1, rs2 } => {
-                // rd ← sx(rs1) + sx(rs2)
-                self.write_register(
-                    rd,
-                    (self.read_register(rs1) as i64).wrapping_add(self.read_register(rs2) as i64)
-                        as u64,
-                );
-                Ok(())
-            }
-            Instruction::SUB { rd, rs1, rs2 } => {
-                // rd ← sx(rs1) - sx(rs2)
-                self.write_register(
-                    rd,
-                    (self.read_register(rs1) as i64).wrapping_sub(self.read_register(rs2) as i64)
-                        as u64,
-                );
-                Ok(())
-            }
-            Instruction::SLL { rd, rs1, rs2 } => {
-                // rd ← ux(rs1) « rs2
-                self.write_register(
-                    rd,
-                    self.read_register(rs1).wrapping_shl(self.read_register(rs2) as u32),
-                );
-                Ok(())
-            }
-            Instruction::SLT { rd, rs1, rs2 } => {
-                // rd ← sx(rs1) < sx(rs2)
-                //self.write_register(rd.
-                self.write_register(
-                    rd,
-                    if (self.read_register(rs1) as i64) < (self.read_register(rs2) as i64) {
-                        1
-                    } else {
-                        0
-                    },
-                );
-                Ok(())
-            }
-            Instruction::SLTU { rd, rs1, rs2 } => {
-                // rd ← ux(rs1) < ux(rs2)
-                self.write_register(
-                    rd,
-                    if self.read_register(rs1) < self.read_register(rs2) { 1 } else { 0 },
-                );
-                Ok(())
-            }
-            Instruction::XOR { rd, rs1, rs2 } => {
-                // rd ← ux(rs1) ⊕ ux(rs2)
-                self.write_register(rd, self.read_register(rs1) ^ self.read_register(rs2));
-                Ok(())
-            }
-            Instruction::SRL { rd, rs1, rs2 } => {
-                // rd ← ux(rs1) » rs2
-                self.write_register(
-                    rd,
-                    self.read_register(rs1).wrapping_shr(self.read_register(rs2) as u32),
-                );
-                Ok(())
-            }
-            Instruction::SRA { rd, rs1, rs2 } => {
-                // rd ← sx(rs1) » rs2
-                self.write_register(
-                    rd,
-                    (self.read_register(rs1) as i64).wrapping_shr(self.read_register(rs2) as u32)
-                        as u64,
-                );
-                Ok(())
-            }
-            Instruction::OR { rd, rs1, rs2 } => {
-                // rd ← ux(rs1) ∨ ux(rs2)
-                self.write_register(rd, self.read_register(rs1) | self.read_register(rs2));
-                Ok(())
-            }
-            Instruction::AND { rd, rs1, rs2 } => {
-                // rd ← ux(rs1) ∧ ux(rs2)
-                self.write_register(rd, self.read_register(rs1) & self.read_register(rs2));
-                Ok(())
-            }
-            Instruction::ADDW { rd, rs1, rs2 } => {
-                // rd ← s32(rs1) + s32(rs2)
-                self.write_register(
-                    rd,
-                    (self.read_register(rs1) as i32).wrapping_add(self.read_register(rs2) as i32)
-                        as u64,
-                );
-                Ok(())
-            }
-            Instruction::SUBW { rd, rs1, rs2 } => {
-                // rd ← s32(rs1) - s32(rs2)
-                self.write_register(
-                    rd,
-                    (self.read_register(rs1) as i32).wrapping_sub(self.read_register(rs2) as i32)
-                        as u64,
-                );
-                Ok(())
-            }
-            Instruction::SLLW { rd, rs1, rs2 } => {
-                // rd ← s32(u32(rs1) « rs2)
-                self.write_register(
-                    rd,
-                    (self.read_register(rs1) as u32).wrapping_shl(self.read_register(rs2) as u32)
-                        as u64,
-                );
-                Ok(())
-            }
-            Instruction::SRLW { rd, rs1, rs2 } => {
-                // rd ← s32(u32(rs1) » rs2)
-                self.write_register(
-                    rd,
-                    (self.read_register(rs1) as u32).wrapping_shr(self.read_register(rs2) as u32)
-                        as u64,
-                );
-                Ok(())
-            }
-            Instruction::SRAW { rd, rs1, rs2 } => {
-                // rd ← s32(rs1) » rs2
-                self.write_register(
-                    rd,
-                    (self.read_register(rs1) as i32).wrapping_shr(self.read_register(rs2) as u32)
-                        as u32 as u64,
-                );
-                Ok(())
-            }
-            Instruction::SB { rs1, rs2, offset } => {
-                // u8[rs1 + offset] ← rs2
-                let a = addiu(self.read_register(rs1), i32::from(offset));
-                self.memory.store_slice(a, &(self.read_register(rs2) as u8).to_le_bytes()).unwrap();
-                Ok(())
-            }
-            Instruction::SH { rs1, rs2, offset } => {
-                // u16[rs1 + offset] ← rs2
-                let a = addiu(self.read_register(rs1), i32::from(offset));
-                self.memory
-                    .store_slice(a, &(self.read_register(rs2) as u16).to_le_bytes())
-                    .unwrap();
-                Ok(())
-            }
-            Instruction::SW { rs1, rs2, offset } => {
-                // u32[rs1 + offset] ← rs2
-                let a = addiu(self.read_register(rs1), i32::from(offset));
-                self.memory
-                    .store_slice(a, &(self.read_register(rs2) as u32).to_le_bytes())
-                    .unwrap();
-                Ok(())
-            }
-            Instruction::SD { rs1, rs2, offset } => {
-                // u64[rs1 + offset] ← rs2
-                let a = addiu(self.read_register(rs1), i32::from(offset));
-                self.memory
-                    .store_slice(a, &(self.read_register(rs2) as u64).to_le_bytes())
-                    .unwrap();
-                Ok(())
-            }
-            Instruction::LUI { rd, imm } => {
-                // rd ← imm
-                self.write_register(rd, u64::from(imm.wrapping_shl(12)));
-                Ok(())
-            }
-            Instruction::AUIPC { rd, offset } => {
-                // rd ← pc + offset
-                self.write_register(
-                    rd,
-                    (self.program_counter as u32).wrapping_add((offset as u32) << 12) as u64,
-                );
-                Ok(())
-            }
-            Instruction::BEQ { rs1, rs2, offset } => {
-                // if rs1 = rs2 then pc ← pc + offset
-                if self.read_register(rs1) == self.read_register(rs2) {
-                    self.program_counter = addiu(self.program_counter as u64, i32::from(offset));
-                }
-                Ok(())
-            }
-            Instruction::BNE { rs1, rs2, offset } => {
-                // if rs1 ≠ rs2 then pc ← pc + offset
-                if self.read_register(rs1) != self.read_register(rs2) {
-                    self.program_counter = addiu(self.program_counter as u64, i32::from(offset));
-                }
-                Ok(())
-            }
-            Instruction::BLT { rs1, rs2, offset } => {
-                // if rs1 < rs2 then pc ← pc + offset
-                if (self.read_register(rs1) as i64) < (self.read_register(rs2) as i64) {
-                    self.program_counter = addiu(self.program_counter as u64, i32::from(offset));
-                }
-                Ok(())
-            }
-            Instruction::BGE { rs1, rs2, offset } => {
-                // if rs1 ≥ rs2 then pc ← pc + offset
-                if (self.read_register(rs1) as i64) >= (self.read_register(rs2) as i64) {
-                    self.program_counter = addiu(self.program_counter as u64, i32::from(offset));
-                }
-                Ok(())
-            }
-            Instruction::BLTU { rs1, rs2, offset } => {
-                // if rs1 < rs2 then pc ← pc + offset
-                if (self.read_register(rs1) as u64) < (self.read_register(rs2) as u64) {
-                    self.program_counter = addiu(self.program_counter as u64, i32::from(offset));
-                }
-                Ok(())
-            }
-            Instruction::BGEU { rs1, rs2, offset } => {
-                // if rs1 ≥ rs2 then pc ← pc + offset
-                if (self.read_register(rs1) as u64) >= (self.read_register(rs2) as u64) {
-                    self.program_counter = addiu(self.program_counter as u64, i32::from(offset));
-                }
-                Ok(())
-            }
-            Instruction::FENCE { .. } | Instruction::FENCEI {} => {
-                Ok(()) /* no-op */
-            }
-            Instruction::ECALL {} => Err(ExecutionError::new("instruction ECALL not implemented")),
-            Instruction::EBREAK {} => {
-                Err(ExecutionError::new("instruction EBREAK not implemented"))
-            }
-            Instruction::CSRRW { .. } => {
-                Err(ExecutionError::new("instruction CSRRW not implemented"))
-            }
-            Instruction::CSRRS { .. } => {
-                Err(ExecutionError::new("instruction CSRRS not implemented"))
-            }
-            Instruction::CSRRC { .. } => {
-                Err(ExecutionError::new("instruction CSRRC not implemented"))
-            }
-            Instruction::CSRRWI { .. } => {
-                Err(ExecutionError::new("instruction CSRRWI not implemented"))
-            }
-            Instruction::CSRRSI { .. } => {
-                Err(ExecutionError::new("instruction CSRRSI not implemented"))
-            }
-            Instruction::CSRRCI { .. } => {
-                Err(ExecutionError::new("instruction CSRRCI not implemented"))
-            }
-            Instruction::UNKNOWN { instruction } => {
-                Err(ExecutionError::new(&format!("unknown instruction: {:X}", instruction)))
-            }
+
+            I::UNKNOWN { word } => return Err(Trap::IllegalInstruction { pc, word }),
         }
+        Ok(next)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{instructions::Instruction, memory::Memory, types::Address};
+    use super::*;
+    use crate::devices::ConsoleOut;
+    use crate::input::{Button, Input, Pad};
+    use crate::instructions::Instruction as I;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
-    use super::Machine;
+    const ROM: Address = 0x0000_0000;
+    const RAM: Address = 0x0200_0000;
 
-    #[test]
-    /// Writes to register[0] should not alter it's value
-    fn test_zero_register() {
-        let mut m = Machine::new();
-        assert!(m.execute(Instruction::ADDI { rd: 0, rs: 0, imm: 1 }).is_ok());
-        assert_eq!(m.registers[0], 0);
+    fn image(program: &[I]) -> Vec<u8> {
+        program.iter().flat_map(|i| i.encode().to_le_bytes()).collect()
     }
 
-    #[test]
-    fn test_lb() {
-        fn t(x: u64, offset: i16) -> u64 {
-            let mut m = Machine::new();
-            let a: u64 = 0x1000;
-            let data = x.to_le_bytes();
-            m.memory.map_ro(a, &data);
-            m.registers[10] = a as u64 - offset as u64;
-            assert!(m.execute(Instruction::LB { rs: 10, rd: 10, offset: offset }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x80), 0xFFFFFFF0)
+    /// A machine with the program in ROM at 0 and 1 KiB of RAM.
+    fn machine(program: &[I]) -> Machine {
+        let mut bus = Bus::new();
+        bus.map_rom(ROM, image(program)).unwrap();
+        bus.map_ram(RAM, 1024).unwrap();
+        Machine::new(bus)
     }
-    #[test]
-    fn test_lh() {
-        fn t(x: u64, offset: i16) -> u64 {
-            let mut m = Machine::new();
-            let a = 0x1000;
-            let data = x.to_le_bytes();
-            m.memory.map_ro(a, &data);
-            m.registers[10] = a as u64 - offset as u64;
-            assert!(m.execute(Instruction::LH { rs: 10, rd: 10, offset: offset }).is_ok());
-            m.registers[10]
+
+    /// Run to the first trap, which the test programs make an `EBREAK`.
+    fn run(program: &[I]) -> Machine {
+        let mut m = machine(program);
+        match m.run(1000) {
+            Err(Trap::Breakpoint { .. }) => m,
+            other => panic!("expected EBREAK, got {other:?}"),
         }
-        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x80), 0xFFFFF1F0)
     }
-    #[test]
-    fn test_lw() {
-        fn t(x: u64, offset: i16) -> u64 {
-            let mut m = Machine::new();
-            let a = 0x1000;
-            let data = x.to_le_bytes();
-            m.memory.map_ro(a, &data);
-            m.registers[10] = a as u64 - offset as u64;
-            assert!(m.execute(Instruction::LW { rs: 10, rd: 10, offset: offset }).is_ok());
-            m.registers[10]
+
+    /// Execute one instruction in isolation and read back a register.
+    fn exec(setup: &[(Register, u32)], instruction: I, read: Register) -> u32 {
+        let mut m = Machine::new(Bus::new());
+        for (r, v) in setup {
+            m.set_register(*r, *v);
         }
-        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x80), 0xFFFFFFFFF3F2F1F0)
-    }
-    #[test]
-    fn test_ld() {
-        fn t(x: u64, offset: i16) -> u64 {
-            let data = x.to_le_bytes();
-            let mut m = Machine::new();
-            let a = 0x1000;
-            m.memory.map_ro(0x1000, &data);
-            m.registers[10] = a as u64 - offset as u64;
-            assert!(m.execute(Instruction::LD { rs: 10, rd: 10, offset: offset }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x80), 0xF7F6F5F4F3F2F1F0)
-    }
-    #[test]
-    fn test_lbu() {
-        fn t(x: u64, offset: i16) -> u64 {
-            let mut m = Machine::new();
-            let a = 0x1000;
-            let data = x.to_le_bytes();
-            m.memory.map_ro(a, &data);
-            m.registers[10] = a as u64 - offset as u64;
-            assert!(m.execute(Instruction::LBU { rs: 10, rd: 10, offset: offset }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x80), 0x000000F0)
-    }
-    #[test]
-    fn test_lhu() {
-        fn t(x: u64, offset: i16) -> u64 {
-            let mut m = Machine::new();
-            let a = 0x1000;
-            let data = x.to_le_bytes();
-            m.memory.map_ro(a, &data);
-            m.registers[10] = a as u64 - offset as u64;
-            assert!(m.execute(Instruction::LHU { rs: 10, rd: 10, offset: offset }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x80), 0x0000F1F0)
-    }
-    #[test]
-    fn test_lwu() {
-        fn t(x: u64, offset: i16) -> u64 {
-            let mut m = Machine::new();
-            let a = 0x1000;
-            let data = x.to_le_bytes();
-            m.memory.map_ro(a, &data);
-            m.registers[10] = a as u64 - offset as u64;
-            assert!(m.execute(Instruction::LWU { rs: 10, rd: 10, offset: offset }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x80), 0x0000000F3F2F1F0)
-    }
-    #[test]
-    fn test_addi() {
-        fn t(a: u64, i: i16) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a;
-            assert!(m.execute(Instruction::ADDI { rd: 10, rs: 10, imm: i }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0x1000, 2), 0x1002);
-    }
-    #[test]
-    fn test_slli() {
-        fn t(a: u64, i: u8) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a;
-            assert!(m.execute(Instruction::SLLI { rd: 10, rs: 10, imm: i }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0x1000, 4), 0x10000);
+        m.execute(instruction).unwrap();
+        m.register(read)
     }
 
     #[test]
-    fn test_slti() {
-        fn t(a: u64, i: i16) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a;
-            assert!(m.execute(Instruction::SLTI { rd: 10, rs: 10, imm: i }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(1, -1), 0);
-        assert_eq!(t(1, 5), 1);
+    fn register_zero_stays_zero() {
+        let mut m = Machine::new(Bus::new());
+        m.execute(I::ADDI { rd: 0, rs1: 0, imm: 1 }).unwrap();
+        assert_eq!(m.register(0), 0);
+        m.set_register(0, 0xFFFF_FFFF);
+        assert_eq!(m.register(0), 0);
     }
+
+    // -- the PC-relative regressions ----------------------------------------
+
     #[test]
-    fn test_sltiu() {
-        fn t(a: u64, i: i16) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a;
-            assert!(m.execute(Instruction::SLTIU { rd: 10, rs: 10, imm: i as u16 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(1, 0), 0);
-        assert_eq!(t(66, 9999), 1);
+    fn auipc_is_relative_to_its_own_address() {
+        // AUIPC at 0x0 with a zero immediate must yield 0x0, not 0x4.
+        let m = run(&[I::AUIPC { rd: 10, imm: 0 }, I::EBREAK]);
+        assert_eq!(m.register(10), 0);
+
+        // …and at 0x4, 0x4.
+        let m = run(&[I::ADDI { rd: 0, rs1: 0, imm: 0 }, I::AUIPC { rd: 10, imm: 0 }, I::EBREAK]);
+        assert_eq!(m.register(10), 4);
+
+        // The immediate is a full 32-bit value and wraps, not truncates.
+        let m = run(&[I::AUIPC { rd: 10, imm: -0x1000 }, I::EBREAK]);
+        assert_eq!(m.register(10), 0xFFFF_F000);
     }
 
     #[test]
-    fn test_xori() {
-        fn t(a: u64, i: u16) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a;
-            assert!(m.execute(Instruction::XORI { rd: 10, rs: 10, imm: i }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xAA, 0x3C), 0b10010110);
-    }
-    #[test]
-    fn test_srli() {
-        fn t(a: u64, i: u8) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a;
-            assert!(m.execute(Instruction::SRLI { rd: 10, rs: 10, imm: i }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xA7A6A5A4A3A2A1A0, 24), 0x000000A7A6A5A4A3);
-    }
-    #[test]
-    fn test_srai() {
-        fn t(a: u64, i: u8) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a;
-            assert!(m.execute(Instruction::SRAI { rd: 10, rs: 10, imm: i }).is_ok());
-            m.registers[10]
-        }
-
-        assert_eq!(t(0xA7A6A5A4A3A2A1A0, 24), 0xFFFFFFA7A6A5A4A3);
-    }
-    #[test]
-    fn test_ori() {
-        fn t(a: u64, i: u16) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a;
-            assert!(m.execute(Instruction::ORI { rd: 10, rs: 10, imm: i }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xAA, 0x3C), 0b10111110);
-    }
-    #[test]
-    fn test_andi() {
-        fn t(a: u64, i: u16) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a;
-            assert!(m.execute(Instruction::ANDI { rd: 10, rs: 10, imm: i }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xAA, 0x3C), 0b00101000);
-    }
-    #[test]
-    fn test_addiw() {
-        fn t(a: i64, i: i16) -> i64 {
-            let mut m = Machine::new();
-            m.registers[10] = a as u64;
-            assert!(m.execute(Instruction::ADDIW { rd: 10, rs: 10, imm: i }).is_ok());
-            m.registers[10] as i64
-        }
-        assert_eq!(t(0, -1), -1);
-        assert_eq!(t(-1, -1), -2);
-    }
-    #[test]
-    fn test_slliw() {
-        fn t(a: u64, i: u8) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a;
-            assert!(m.execute(Instruction::SLLIW { rd: 10, rs: 10, imm: i }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xA7A6A5A4A3A2A1A0, 8), 0xA2A1A000);
-    }
-    #[test]
-    fn test_srliw() {
-        fn t(a: u64, i: u8) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a;
-            assert!(m.execute(Instruction::SRLIW { rd: 10, rs: 10, imm: i }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xA7A6A5A4A3A2A1A0, 8), 0x00A3A2A1);
-    }
-    #[test]
-    fn test_sraiw() {
-        fn t(a: u64, i: u8) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a;
-            assert!(m.execute(Instruction::SRAIW { rd: 10, rs: 10, imm: i }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xA7A6A5A4A3A2A1A0, 8), 0xFFA3A2A1);
+    fn a_forward_branch_lands_on_its_target() {
+        // BEQ at 0x4 with offset +8 must reach 0xC, skipping the ADDI at 0x8.
+        let m = run(&[
+            I::ADDI { rd: 10, rs1: 0, imm: 1 },   // 0x0
+            I::BEQ { rs1: 0, rs2: 0, offset: 8 }, // 0x4 -> 0xC
+            I::ADDI { rd: 10, rs1: 0, imm: 99 },  // 0x8, skipped
+            I::EBREAK,                            // 0xC
+        ]);
+        assert_eq!(m.register(10), 1);
+        assert_eq!(m.pc(), 0xC);
     }
 
     #[test]
-    fn test_jalr() {
-        fn t(pc: Address, a: u64, i: i16) -> (Address, u64) {
-            let mut m = Machine::new();
-            m.program_counter = pc;
-            m.registers[10] = a;
-            assert!(m.execute(Instruction::JALR { rd: 10, rs: 10, offset: i }).is_ok());
-            (m.program_counter, m.registers[10])
-        }
-        assert_eq!(t(100, 200, 16), (216, 100));
-        //assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x2000, 7), (0x2007, 0xF7F6F5F4F3F2F1F4));
-        //assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0x2000, -6), (0x1FFA, 0xF7F6F5F4F3F2F1F4));
-    }
-    #[test]
-    fn test_jal() {
-        fn t(pc: Address, offset: i32) -> (Address, u64) {
-            let mut m = Machine::new();
-            m.program_counter = pc;
-            assert!(m.execute(Instruction::JAL { rd: 10, offset: offset }).is_ok());
-            (m.program_counter, m.registers[10])
-        }
-        assert_eq!(t(0xF000, 0xA0), (0xF0A0, 0xF004));
-
-        // j-immediate should drop low bit
-    }
-    #[test]
-    fn test_add() {
-        fn t(a: u64, b: u64) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a;
-            m.registers[11] = b;
-            assert!(m.execute(Instruction::ADD { rd: 10, rs1: 10, rs2: 11 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0x5756555453525150, 0x5F5E5D5C5B5A5958), 0xB6B4B2B0AEACAAA8);
-        assert_eq!(t(22, -1 as i64 as u64), 21);
-    }
-    #[test]
-    fn test_sub() {
-        fn t(a: u64, b: u64) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a;
-            m.registers[11] = b;
-            assert!(m.execute(Instruction::SUB { rd: 10, rs1: 10, rs2: 11 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0x5F5E5D5C5B5A5958, 0x5756555453525150), 0x0808080808080808);
-    }
-    #[test]
-    fn test_sll() {
-        fn t(a: u64, b: u64) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::SLL { rd: 10, rs1: 10, rs2: 11 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 0), 0xF7F6F5F4F3F2F1F0);
-        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 8), 0xF6F5F4F3F2F1F000);
-    }
-    #[test]
-    fn test_slt() {
-        fn t(a: i64, b: i64) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::SLT { rd: 10, rs1: 10, rs2: 11 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(1, -1), 0);
-        assert_eq!(t(1, 5), 1);
-    }
-    #[test]
-    fn test_sltu() {
-        fn t(a: i64, b: i64) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::SLTU { rd: 10, rs1: 10, rs2: 11 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(1, 0), 0);
-        assert_eq!(t(66, 9999), 1);
-    }
-    #[test]
-    fn test_xor() {
-        fn t(a: u64, b: u64) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::XOR { rd: 10, rs1: 10, rs2: 11 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0b10101010, 0b00111100), 0b10010110);
-    }
-    #[test]
-    fn test_srl() {
-        fn t(a: u64, b: u64) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::SRL { rd: 10, rs1: 10, rs2: 11 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 32), 0x00000000F7F6F5F4);
-    }
-    #[test]
-    fn test_sra() {
-        fn t(a: u64, b: u64) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::SRA { rd: 10, rs1: 10, rs2: 11 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 32), 0xFFFFFFFFF7F6F5F4);
-    }
-    #[test]
-    fn test_or() {
-        fn t(a: u64, b: u64) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::OR { rd: 10, rs1: 10, rs2: 11 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0b10101010, 0b00111100), 0b10111110);
-    }
-    #[test]
-    fn test_and() {
-        fn t(a: u64, b: u64) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::AND { rd: 10, rs1: 10, rs2: 11 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0b10101010, 0b00111100), 0b00101000);
-    }
-    #[test]
-    fn test_addw() {
-        fn t(a: u64, b: u64) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::ADDW { rd: 10, rs1: 10, rs2: 11 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(10, 7), 17);
-    }
-    #[test]
-    fn test_subw() {
-        fn t(a: u64, b: u64) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::SUBW { rd: 10, rs1: 10, rs2: 11 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(10, 7), 3);
-    }
-    #[test]
-    fn test_sllw() {
-        fn t(a: u64, b: u64) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::SLLW { rd: 10, rs1: 10, rs2: 11 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 8), 0x00000000F2F1F000);
-    }
-    #[test]
-    fn test_srlw() {
-        fn t(a: u64, b: u64) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::SRLW { rd: 10, rs1: 10, rs2: 11 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 8), 0x0000000000F3F2F1);
-    }
-    #[test]
-    fn test_sraw() {
-        fn t(a: u64, b: u64) -> u64 {
-            let mut m = Machine::new();
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::SRAW { rd: 10, rs1: 10, rs2: 11 }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xF7F6F5F4F3F2F1F0, 8), 0x00000000FFF3F2F1);
-    }
-    #[test]
-    fn test_sb() {
-        fn t(a: u64, b: u64, i: i16) -> [u8; 8] {
-            let mut m = Machine::new();
-            let mut data = [0, 0, 0, 0, 0, 0, 0, 0];
-            m.memory.map(2000, &mut data);
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::SB { rs1: 10, rs2: 11, offset: i }).is_ok());
-            m.memory.load_array(2000).unwrap()
-        }
-
-        assert_eq!(t(2000, 0xA7A6A5A4A3A2A1A0, 0), [0xA0, 0, 0, 0, 0, 0, 0, 0])
-    }
-    #[test]
-    fn test_sh() {
-        fn t(a: u64, b: u64, i: i16) -> [u8; 8] {
-            let mut data = [0, 0, 0, 0, 0, 0, 0, 0];
-            let mut m = Machine::new();
-            m.memory.map(2000, &mut data);
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::SH { rs1: 10, rs2: 11, offset: i }).is_ok());
-            m.memory.load_array(2000).unwrap()
-        }
-
-        assert_eq!(t(2000, 0xA7A6A5A4A3A2A1A0, 0), [0xA0, 0xA1, 0, 0, 0, 0, 0, 0])
-    }
-    #[test]
-    fn test_sw() {
-        fn t(a: u64, b: u64, i: i16) -> [u8; 8] {
-            let mut data = [0, 0, 0, 0, 0, 0, 0, 0];
-            let mut m = Machine::new();
-            m.memory.map(2000, &mut data);
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::SW { rs1: 10, rs2: 11, offset: i }).is_ok());
-            m.memory.load_array(2000).unwrap()
-        }
-
-        assert_eq!(t(2000, 0xA7A6A5A4A3A2A1A0, 0), [0xA0, 0xA1, 0xA2, 0xA3, 0, 0, 0, 0])
-    }
-    #[test]
-    fn test_sd() {
-        fn t(a: u64, b: u64, i: i16) -> [u8; 8] {
-            let mut data = [0, 0, 0, 0, 0, 0, 0, 0];
-            let mut m = Machine::new();
-            m.memory.map(2000, &mut data);
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::SD { rs1: 10, rs2: 11, offset: i }).is_ok());
-            m.memory.load_array(2000).unwrap()
-        }
-
-        assert_eq!(t(2000, 0xA7A6A5A4A3A2A1A0, 0), [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7])
-    }
-    #[test]
-    fn test_beq() {
-        fn t(a: u64, b: u64, offset: i16) -> Address {
-            let mut m = Machine::new();
-            m.program_counter = 0x1000;
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::BEQ { rs1: 10, rs2: 11, offset: offset }).is_ok());
-            m.program_counter
-        }
-        assert_eq!(t(0xA, 0xA, 0x3FF), 0x13FF);
-        assert_eq!(t(0xA, 0xB, 0x3FF), 0x1000);
-    }
-    #[test]
-    fn test_bne() {
-        fn t(a: u64, b: u64, offset: i16) -> Address {
-            let mut m = Machine::new();
-            m.program_counter = 0x1000;
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::BNE { rs1: 10, rs2: 11, offset: offset }).is_ok());
-            m.program_counter
-        }
-        assert_eq!(t(0xA, 0xB, 2), 0x1002);
-        assert_eq!(t(0xA, 0xA, 2), 0x1000);
-        assert_eq!(t(0xA, 0xB, -2), 0x0FFE);
-    }
-    #[test]
-    fn test_blt() {
-        fn t(a: u64, b: u64, offset: i16) -> Address {
-            let mut m = Machine::new();
-            m.program_counter = 0x1000;
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::BLT { rs1: 10, rs2: 11, offset: offset }).is_ok());
-            m.program_counter
-        }
-        assert_eq!(t(0xA, 0xB, 0x1), 0x1001);
-        assert_eq!(t(0xB, 0xB, 0x1), 0x1000);
-        assert_eq!(t(0xC, 0xB, 0x1), 0x1000);
-    }
-    #[test]
-    fn test_bge() {
-        fn t(a: u64, b: u64, offset: i16) -> Address {
-            let mut m = Machine::new();
-            m.program_counter = 0x1000;
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::BGE { rs1: 10, rs2: 11, offset: offset }).is_ok());
-            m.program_counter
-        }
-        assert_eq!(t(0xA, 0xB, 0x1), 0x1000);
-        assert_eq!(t(0xB, 0xB, 0x1), 0x1001);
-        assert_eq!(t(0xC, 0xB, 0x1), 0x1001);
-    }
-    #[test]
-    fn test_bltu() {
-        fn t(a: u64, b: u64, offset: i16) -> Address {
-            let mut m = Machine::new();
-            m.program_counter = 0x1000;
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::BLTU { rs1: 10, rs2: 11, offset: offset }).is_ok());
-            m.program_counter
-        }
-        assert_eq!(t(0xA, 0xB, 0x1), 0x1001);
-        assert_eq!(t(0xB, 0xB, 0x1), 0x1000);
-        assert_eq!(t(0xC, 0xB, 0x1), 0x1000);
-    }
-    #[test]
-    fn test_bgeu() {
-        fn t(a: u64, b: u64, offset: i16) -> Address {
-            let mut m = Machine::new();
-            m.program_counter = 0x1000;
-            m.registers[10] = a as u64;
-            m.registers[11] = b as u64;
-            assert!(m.execute(Instruction::BGEU { rs1: 10, rs2: 11, offset: offset }).is_ok());
-            m.program_counter
-        }
-        assert_eq!(t(0xA, 0xB, 0x1), 0x1000);
-        assert_eq!(t(0xB, 0xB, 0x1), 0x1001);
-        assert_eq!(t(0xC, 0xB, 0x1), 0x1001);
-    }
-    #[test]
-    fn test_auipc() {
-        fn t(offset: u32, pc: Address) -> u64 {
-            let mut m = Machine::new();
-            m.program_counter = pc;
-            assert!(m.execute(Instruction::AUIPC { rd: 6, offset }).is_ok());
-            m.registers[6]
-        }
-        assert_eq!(t(0xC, 0xA0), 0x0C0A0);
-        assert_eq!(t(0xF0F0F0F0, 0x1), 0x0F0F0001);
-        assert_eq!(t(0, 0x0000000C), 0x0000000C);
-    }
-    #[test]
-    fn test_lui() {
-        fn t(offset: u32) -> u64 {
-            let mut m = Machine::new();
-            assert!(m.execute(Instruction::LUI { rd: 10, imm: offset }).is_ok());
-            m.registers[10]
-        }
-        assert_eq!(t(0xB), 0xB000);
-        assert_eq!(t(0xF0F0F0F0), 0x0F0F0000);
-    }
-    #[test]
-    fn test_fence() {
-        assert!(Machine::new().execute(Instruction::FENCE { pred: 0, succ: 0 }).is_ok());
-    }
-    #[test]
-    fn test_fencei() {
-        assert!(Machine::new().execute(Instruction::FENCEI {}).is_ok());
-    }
-    #[test]
-    fn test_ecall() {
-        assert!(Machine::new().execute(Instruction::ECALL {}).is_err());
-    }
-    #[test]
-    fn test_ebreak() {
-        assert!(Machine::new().execute(Instruction::EBREAK {}).is_err());
-    }
-    #[test]
-    fn test_csrrw() {
-        assert!(Machine::new().execute(Instruction::CSRRW { rd: 10, rs: 10, csr: 0 }).is_err());
-    }
-    #[test]
-    fn test_csrrs() {
-        assert!(Machine::new().execute(Instruction::CSRRS { rd: 10, rs: 10, csr: 0 }).is_err());
-    }
-    #[test]
-    fn test_csrrc() {
-        assert!(Machine::new().execute(Instruction::CSRRC { rd: 10, rs: 10, csr: 0 }).is_err());
-    }
-    #[test]
-    fn test_csrrwi() {
-        assert!(Machine::new().execute(Instruction::CSRRWI { rd: 10, zimm: 0, csr: 0 }).is_err());
-    }
-    #[test]
-    fn test_csrrsi() {
-        assert!(Machine::new().execute(Instruction::CSRRSI { rd: 10, zimm: 0, csr: 0 }).is_err());
-    }
-    #[test]
-    fn test_csrrci() {
-        assert!(Machine::new().execute(Instruction::CSRRCI { rd: 10, zimm: 0, csr: 0 }).is_err());
-    }
-    #[test]
-    fn test_unknown() {
-        assert!(Machine::new().execute(Instruction::UNKNOWN { instruction: 0 }).is_err());
+    fn jal_targets_its_own_address_and_links_past_itself() {
+        let m = run(&[
+            I::JAL { rd: 1, offset: 8 },         // 0x0 -> 0x8
+            I::ADDI { rd: 10, rs1: 0, imm: 99 }, // 0x4, skipped
+            I::EBREAK,                           // 0x8
+        ]);
+        assert_eq!(m.pc(), 0x8);
+        assert_eq!(m.register(1), 0x4, "link register is the instruction after JAL");
     }
 
     #[test]
-    fn test_program_multiply() {
+    fn a_backward_branch_closes_a_loop() {
+        // Count down from 3; the loop body is two instructions.
+        let m = run(&[
+            I::ADDI { rd: 10, rs1: 0, imm: 3 },     // 0x0
+            I::ADDI { rd: 10, rs1: 10, imm: -1 },   // 0x4  loop:
+            I::BNE { rs1: 10, rs2: 0, offset: -4 }, // 0x8  -> 0x4
+            I::EBREAK,                              // 0xC
+        ]);
+        assert_eq!(m.register(10), 0);
+        assert_eq!(m.cycles(), 1 + 3 * 2);
+    }
+
+    #[test]
+    fn jalr_links_and_clears_the_low_bit() {
+        let mut m = machine(&[I::JALR { rd: 1, rs1: 5, offset: 0 }, I::EBREAK]);
+        m.set_register(5, 0x9); // odd target
+        m.step().unwrap();
+        assert_eq!(m.pc(), 0x8, "low bit is cleared, not rounded");
+        assert_eq!(m.register(1), 0x4);
+    }
+
+    #[test]
+    fn a_two_byte_aligned_jump_target_is_legal() {
+        // Compressed instructions are 2 bytes, so odd multiples of two are
+        // perfectly good instruction addresses.
+        let mut m = machine(&[I::JALR { rd: 1, rs1: 5, offset: 0 }, I::EBREAK]);
+        m.set_register(5, 0xA);
+        m.step().unwrap();
+        assert_eq!(m.pc(), 0xA);
+    }
+
+    #[test]
+    fn an_odd_jump_target_traps_at_the_jump() {
+        // JALR clears the low bit and encoded displacements are always even,
+        // so this is only reachable from a hand-built instruction — but it is
+        // the guard that keeps the fetch stream aligned.
+        let mut m = machine(&[I::EBREAK]);
+        assert_eq!(
+            m.execute(I::JAL { rd: 0, offset: 1 }),
+            Err(Trap::MisalignedJump { pc: 0, target: 1 })
+        );
+        assert_eq!(m.pc(), 0, "pc stays on the instruction that trapped");
+        assert_eq!(m.register(0), 0, "the link is not written on a failed jump");
+    }
+
+    #[test]
+    fn compressed_instructions_are_two_bytes_wide() {
+        // c.addi a0, 1 ; c.addi a0, 1 ; ebreak (32-bit). The link after a
+        // compressed JAL is 2 bytes on, not 4.
+        let mut bus = Bus::new();
+        let mut image = Vec::new();
+        image.extend_from_slice(&0x0505u16.to_le_bytes()); // 0x0 c.addi a0, 1
+        image.extend_from_slice(&0x2001u16.to_le_bytes()); // 0x2 c.jal . (offset 0)
+        bus.map_rom(ROM, image).unwrap();
+        let mut m = Machine::new(bus);
+        m.step().unwrap();
+        assert_eq!(m.pc(), 2);
+        assert_eq!(m.register(10), 1);
+        m.step().unwrap();
+        assert_eq!(m.pc(), 2, "c.jal . loops to itself");
+        assert_eq!(m.register(1), 4, "link is the halfword after the c.jal");
+    }
+
+    // -- sign and zero extension --------------------------------------------
+
+    #[test]
+    fn signed_loads_sign_extend_to_the_full_word() {
+        let mut m = machine(&[I::EBREAK]);
+        m.bus_mut().load(RAM, &[0xF0, 0xF1, 0xF2, 0xF3]).unwrap();
+        m.set_register(5, RAM);
+
+        m.execute(I::LB { rd: 10, rs1: 5, offset: 0 }).unwrap();
+        assert_eq!(m.register(10), 0xFFFF_FFF0);
+        m.execute(I::LH { rd: 10, rs1: 5, offset: 0 }).unwrap();
+        assert_eq!(m.register(10), 0xFFFF_F1F0);
+        m.execute(I::LW { rd: 10, rs1: 5, offset: 0 }).unwrap();
+        assert_eq!(m.register(10), 0xF3F2_F1F0);
+
+        m.execute(I::LBU { rd: 10, rs1: 5, offset: 0 }).unwrap();
+        assert_eq!(m.register(10), 0x0000_00F0);
+        m.execute(I::LHU { rd: 10, rs1: 5, offset: 0 }).unwrap();
+        assert_eq!(m.register(10), 0x0000_F1F0);
+    }
+
+    #[test]
+    fn lui_carries_the_full_value_including_the_sign_bit() {
+        assert_eq!(exec(&[], I::LUI { rd: 10, imm: 0xB000 }, 10), 0xB000);
+        assert_eq!(exec(&[], I::LUI { rd: 10, imm: -0x8000_0000 }, 10), 0x8000_0000);
+        assert_eq!(exec(&[], I::LUI { rd: 10, imm: -0x1000 }, 10), 0xFFFF_F000);
+    }
+
+    #[test]
+    fn logical_immediates_are_sign_extended() {
+        // `andi rd, rs, -1` is the identity, not a mask with 0xFFF.
+        assert_eq!(exec(&[(5, 0xDEAD_BEEF)], I::ANDI { rd: 10, rs1: 5, imm: -1 }, 10), 0xDEAD_BEEF);
+        assert_eq!(exec(&[(5, 0)], I::ORI { rd: 10, rs1: 5, imm: -1 }, 10), 0xFFFF_FFFF);
+        assert_eq!(exec(&[(5, 0)], I::XORI { rd: 10, rs1: 5, imm: -1 }, 10), 0xFFFF_FFFF);
+        assert_eq!(exec(&[(5, 0xAA)], I::ANDI { rd: 10, rs1: 5, imm: 0x3C }, 10), 0x28);
+    }
+
+    #[test]
+    fn sltiu_compares_unsigned_against_a_sign_extended_immediate() {
+        // -1 becomes 0xFFFF_FFFF, which almost everything is below.
+        assert_eq!(exec(&[(5, 1)], I::SLTIU { rd: 10, rs1: 5, imm: -1 }, 10), 1);
+        assert_eq!(exec(&[(5, 0xFFFF_FFFF)], I::SLTIU { rd: 10, rs1: 5, imm: -1 }, 10), 0);
+        assert_eq!(exec(&[(5, 1)], I::SLTIU { rd: 10, rs1: 5, imm: 0 }, 10), 0);
+        assert_eq!(exec(&[(5, 0xFFFF_FFFF)], I::SLTI { rd: 10, rs1: 5, imm: 0 }, 10), 1);
+    }
+
+    #[test]
+    fn addi_reaches_both_ends_of_its_range() {
+        assert_eq!(exec(&[(5, 0)], I::ADDI { rd: 10, rs1: 5, imm: 2047 }, 10), 2047);
+        assert_eq!(exec(&[(5, 0)], I::ADDI { rd: 10, rs1: 5, imm: -2048 }, 10), (-2048i32) as u32);
+        assert_eq!(exec(&[(5, 0)], I::ADDI { rd: 10, rs1: 5, imm: 1024 }, 10), 1024);
+    }
+
+    // -- shifts --------------------------------------------------------------
+
+    #[test]
+    fn shifts_use_only_the_low_five_bits_of_rs2() {
+        assert_eq!(exec(&[(5, 1), (6, 33)], I::SLL { rd: 10, rs1: 5, rs2: 6 }, 10), 2);
+        assert_eq!(
+            exec(&[(5, 0x8000_0000), (6, 32)], I::SRL { rd: 10, rs1: 5, rs2: 6 }, 10),
+            0x8000_0000
+        );
+        assert_eq!(
+            exec(&[(5, 0x8000_0000), (6, 31)], I::SRA { rd: 10, rs1: 5, rs2: 6 }, 10),
+            0xFFFF_FFFF
+        );
+        assert_eq!(exec(&[(5, 0x8000_0000), (6, 31)], I::SRL { rd: 10, rs1: 5, rs2: 6 }, 10), 1);
+    }
+
+    #[test]
+    fn immediate_shifts_behave_the_same() {
+        assert_eq!(exec(&[(5, 0x1000)], I::SLLI { rd: 10, rs1: 5, shamt: 4 }, 10), 0x10000);
+        assert_eq!(exec(&[(5, 0xA3A2_A1A0)], I::SRLI { rd: 10, rs1: 5, shamt: 24 }, 10), 0xA3);
+        assert_eq!(
+            exec(&[(5, 0xA3A2_A1A0)], I::SRAI { rd: 10, rs1: 5, shamt: 24 }, 10),
+            0xFFFF_FFA3
+        );
+    }
+
+    // -- M extension ---------------------------------------------------------
+
+    #[test]
+    fn multiply_produces_both_halves() {
+        assert_eq!(exec(&[(5, 7), (6, 1000)], I::MUL { rd: 10, rs1: 5, rs2: 6 }, 10), 7000);
+        // 0x1234_5678 * 0x1000_0000 overflows 32 bits.
+        let (a, b) = (0x1234_5678u32, 0x1000_0000u32);
+        assert_eq!(
+            exec(&[(5, a), (6, b)], I::MUL { rd: 10, rs1: 5, rs2: 6 }, 10),
+            a.wrapping_mul(b)
+        );
+        assert_eq!(
+            exec(&[(5, a), (6, b)], I::MULHU { rd: 10, rs1: 5, rs2: 6 }, 10),
+            ((u64::from(a) * u64::from(b)) >> 32) as u32
+        );
+        // -1 * -1 = 1, so the high word is 0 signed but 0xFFFF_FFFE unsigned.
+        let neg = 0xFFFF_FFFFu32;
+        assert_eq!(exec(&[(5, neg), (6, neg)], I::MULH { rd: 10, rs1: 5, rs2: 6 }, 10), 0);
+        assert_eq!(
+            exec(&[(5, neg), (6, neg)], I::MULHU { rd: 10, rs1: 5, rs2: 6 }, 10),
+            0xFFFF_FFFE
+        );
+        // MULHSU: rs1 signed (-1), rs2 unsigned (0xFFFF_FFFF).
+        assert_eq!(
+            exec(&[(5, neg), (6, neg)], I::MULHSU { rd: 10, rs1: 5, rs2: 6 }, 10),
+            0xFFFF_FFFF
+        );
+    }
+
+    #[test]
+    fn division_follows_the_spec_instead_of_trapping() {
+        let min = 0x8000_0000u32; // i32::MIN
+        let neg1 = 0xFFFF_FFFFu32;
+
+        assert_eq!(exec(&[(5, 100), (6, 7)], I::DIV { rd: 10, rs1: 5, rs2: 6 }, 10), 14);
+        assert_eq!(exec(&[(5, 100), (6, 7)], I::REM { rd: 10, rs1: 5, rs2: 6 }, 10), 2);
+        // Signed division truncates toward zero.
+        assert_eq!(
+            exec(&[(5, (-7i32) as u32), (6, 2)], I::DIV { rd: 10, rs1: 5, rs2: 6 }, 10),
+            (-3i32) as u32
+        );
+        assert_eq!(
+            exec(&[(5, (-7i32) as u32), (6, 2)], I::REM { rd: 10, rs1: 5, rs2: 6 }, 10),
+            (-1i32) as u32
+        );
+
+        // Divide by zero: all ones for DIV/DIVU, the dividend for REM/REMU.
+        assert_eq!(exec(&[(5, 42), (6, 0)], I::DIV { rd: 10, rs1: 5, rs2: 6 }, 10), neg1);
+        assert_eq!(exec(&[(5, 42), (6, 0)], I::DIVU { rd: 10, rs1: 5, rs2: 6 }, 10), u32::MAX);
+        assert_eq!(exec(&[(5, 42), (6, 0)], I::REM { rd: 10, rs1: 5, rs2: 6 }, 10), 42);
+        assert_eq!(exec(&[(5, 42), (6, 0)], I::REMU { rd: 10, rs1: 5, rs2: 6 }, 10), 42);
+
+        // The one signed overflow: i32::MIN / -1 wraps rather than faulting.
+        assert_eq!(exec(&[(5, min), (6, neg1)], I::DIV { rd: 10, rs1: 5, rs2: 6 }, 10), min);
+        assert_eq!(exec(&[(5, min), (6, neg1)], I::REM { rd: 10, rs1: 5, rs2: 6 }, 10), 0);
+
+        // Unsigned division treats the operands as unsigned.
+        assert_eq!(exec(&[(5, neg1), (6, 2)], I::DIVU { rd: 10, rs1: 5, rs2: 6 }, 10), 0x7FFF_FFFF);
+        assert_eq!(exec(&[(5, neg1), (6, 2)], I::DIV { rd: 10, rs1: 5, rs2: 6 }, 10), 0);
+    }
+
+    // -- traps ---------------------------------------------------------------
+
+    #[test]
+    fn guest_faults_are_traps_not_panics() {
+        let mut m = machine(&[I::LW { rd: 10, rs1: 0, offset: 0x100 }]);
+        assert!(matches!(m.step(), Err(Trap::LoadFault { pc: 0, addr: 0x100, .. })));
+
+        let mut m = machine(&[I::SW { rs1: 0, rs2: 0, offset: 0 }]);
+        assert_eq!(
+            m.step(),
+            Err(Trap::StoreFault { pc: 0, addr: 0, cause: Fault::ReadOnly(0) })
+        );
+
+        // Running off the end of ROM is a fetch fault, not a panic.
+        let mut m = machine(&[I::ADDI { rd: 0, rs1: 0, imm: 0 }]);
+        assert_eq!(m.run(10), Err(Trap::FetchFault { pc: 4 }));
+
+        // So is a 4-byte instruction with only two bytes left.
+        let mut bus = Bus::new();
+        bus.map_rom(ROM, vec![0x13, 0x05]).unwrap(); // half of `addi a0, ...`
+        let mut m = Machine::new(bus);
+        assert_eq!(m.step(), Err(Trap::FetchFault { pc: 0 }));
+
+        // An odd pc cannot be fetched at all.
+        let mut m = machine(&[I::EBREAK]);
+        m.set_pc(1);
+        assert_eq!(m.step(), Err(Trap::MisalignedFetch { pc: 1 }));
+    }
+
+    #[test]
+    fn an_unrecognised_word_is_an_illegal_instruction() {
+        let mut bus = Bus::new();
+        bus.map_rom(ROM, 0xFFFF_FFFFu32.to_le_bytes().to_vec()).unwrap();
+        let mut m = Machine::new(bus);
+        assert_eq!(m.step(), Err(Trap::IllegalInstruction { pc: 0, word: 0xFFFF_FFFF }));
+    }
+
+    #[test]
+    fn ecall_traps_and_retires_so_the_host_can_resume() {
+        let mut m = machine(&[
+            I::ADDI { rd: 10, rs1: 0, imm: 7 },
+            I::ECALL,
+            I::ADDI { rd: 11, rs1: 0, imm: 9 },
+            I::EBREAK,
+        ]);
+        assert_eq!(m.run(100), Err(Trap::EnvironmentCall { pc: 4 }));
+        assert_eq!(m.register(10), 7);
+        assert_eq!(m.pc(), 8, "the ECALL has retired");
+
+        assert_eq!(m.run(100), Err(Trap::Breakpoint { pc: 0xC }));
+        assert_eq!(m.register(11), 9);
+        assert_eq!(m.pc(), 0xC, "the EBREAK has not");
+    }
+
+    #[test]
+    fn run_returns_when_the_budget_is_spent_and_resumes_where_it_left_off() {
+        // A tight infinite loop: `jal x0, 0`.
+        let mut m = machine(&[I::JAL { rd: 0, offset: 0 }]);
+        assert_eq!(m.run(50), Ok(()));
+        assert_eq!(m.cycles(), 50);
+        assert_eq!(m.pc(), 0);
+        assert_eq!(m.run(50), Ok(()));
+        assert_eq!(m.cycles(), 100);
+    }
+
+    #[test]
+    fn csr_access_traps_with_the_register_number() {
+        let mut m = machine(&[I::CSRRS { rd: 10, rs1: 0, csr: 0xF14 }]);
+        assert_eq!(m.step(), Err(Trap::UnsupportedCsr { pc: 0, csr: 0xF14 }));
+    }
+
+    // -- end to end ----------------------------------------------------------
+
+    #[test]
+    fn a_program_can_talk_to_memory_mapped_devices() {
+        const CONSOLE: Address = 0x0400_0000;
+        const PAD: Address = 0x0500_0000;
+
+        let console = Rc::new(RefCell::new(ConsoleOut::default()));
+        let input = Rc::new(RefCell::new(Input::default()));
+
+        // Print "Hi" if A is held, then multiply and stop.
         let program = [
-            Instruction::ADDI { rd: 10, rs: 0, imm: 7 }, // main: a = 7
-            Instruction::ADDI { rd: 11, rs: 0, imm: 8 }, // b = 8
-            Instruction::AUIPC { rd: 6, offset: 0 },     //
-            Instruction::JALR { rd: 1, rs: 6, offset: 2 * 4 }, // a = mul(a,b)
-            Instruction::EBREAK {},                      // exit
-            Instruction::ADD { rd: 12, rs1: 10, rs2: 0 }, // c = a
-            Instruction::ADDI { rd: 10, rs: 0, imm: 0 }, // a = 0
-            Instruction::ADDI { rd: 12, rs: 12, imm: -1 }, // loop: c = c - 1
-            Instruction::ADD { rd: 10, rs1: 10, rs2: 11 }, // a = a + b
-            Instruction::BNE { rs1: 12, rs2: 0, offset: -3 * 4 }, // if c != 0 then loop
-            Instruction::JALR { rd: 0, rs: 1, offset: 0 }, // return
+            I::LUI { rd: 5, imm: PAD as i32 },      // 0x00 t0 = input
+            I::LHU { rd: 6, rs1: 5, offset: 0x10 }, // 0x04 t1 = pad 0 buttons
+            I::ANDI { rd: 6, rs1: 6, imm: Button::A.mask() as i32 }, // 0x08
+            I::BEQ { rs1: 6, rs2: 0, offset: 24 },  // 0x0C -> 0x24
+            I::LUI { rd: 7, imm: CONSOLE as i32 },  // 0x10 t2 = console
+            I::ADDI { rd: 8, rs1: 0, imm: b'H' as i32 }, // 0x14
+            I::SB { rs1: 7, rs2: 8, offset: 0 },    // 0x18
+            I::ADDI { rd: 8, rs1: 0, imm: b'i' as i32 }, // 0x1C
+            I::SB { rs1: 7, rs2: 8, offset: 0 },    // 0x20
+            I::ADDI { rd: 10, rs1: 0, imm: 7 },     // 0x24
+            I::ADDI { rd: 11, rs1: 0, imm: 1000 },  // 0x28
+            I::MUL { rd: 10, rs1: 10, rs2: 11 },    // 0x2C
+            I::EBREAK,                              // 0x30
         ];
 
-        let memory_bytes = {
-            let mut memory_bytes = [0; 65536];
-            let mut i = 0;
-            for instruction in program {
-                let code = instruction.encode().to_le_bytes();
-                memory_bytes[i..i + code.len()].copy_from_slice(&code);
-                i = i + code.len();
-            }
-            memory_bytes
-        };
+        let mut bus = Bus::new();
+        bus.map_rom(ROM, image(&program)).unwrap();
+        bus.map_ram(RAM, 1024).unwrap();
+        bus.map_device(CONSOLE, console.clone()).unwrap();
+        bus.map_device(PAD, input.clone()).unwrap();
+        let mut m = Machine::new(bus);
 
-        let mut m = Machine::new_with_program(&memory_bytes);
-        assert!(m.run().is_err()); // Program termnates with 'error: instruction EBREAK not implemented'
-        assert_eq!(m.registers[10], 0x38);
-        assert_eq!(m.program_counter, 0x14);
+        // Host pushes input in before the frame runs.
+        input
+            .borrow_mut()
+            .set_pad(0, Pad { buttons: Button::A.mask(), connected: true, ..Pad::default() });
+
+        assert_eq!(m.run(100), Err(Trap::Breakpoint { pc: 0x30 }));
+        assert_eq!(m.register(10), 7000);
+        assert_eq!(console.borrow_mut().take_string(), "Hi");
+
+        // With A released the guest takes the branch and prints nothing.
+        input.borrow_mut().set_pad(0, Pad { connected: true, ..Pad::default() });
+        m.set_pc(0);
+        assert_eq!(m.run(100), Err(Trap::Breakpoint { pc: 0x30 }));
+        assert_eq!(console.borrow_mut().take_string(), "");
+    }
+
+    #[test]
+    fn a_program_can_walk_a_string_out_of_rom() {
+        // Exercises AUIPC, a backward branch, LBU, and a device store —
+        // every one of which depended on a PC base or an extension rule.
+        const CONSOLE: Address = 0x0400_0000;
+        let console = Rc::new(RefCell::new(ConsoleOut::default()));
+
+        let message = b"hello\n\0";
+        // The message is appended straight after the code, so its address is
+        // the code length — which AUIPC + ADDI reconstructs at run time.
+        const CODE_WORDS: i32 = 9;
+        let code = [
+            I::AUIPC { rd: 5, imm: 0 },                     // 0x00 t0 = 0x00
+            I::ADDI { rd: 5, rs1: 5, imm: CODE_WORDS * 4 }, // 0x04 t0 = &message
+            I::LUI { rd: 6, imm: CONSOLE as i32 },          // 0x08 t1 = console
+            I::LBU { rd: 7, rs1: 5, offset: 0 },            // 0x0C loop:
+            I::BEQ { rs1: 7, rs2: 0, offset: 16 },          // 0x10 -> 0x20 done
+            I::SB { rs1: 6, rs2: 7, offset: 0 },            // 0x14
+            I::ADDI { rd: 5, rs1: 5, imm: 1 },              // 0x18
+            I::JAL { rd: 0, offset: -16 },                  // 0x1C -> 0x0C loop
+            I::EBREAK,                                      // 0x20 done:
+        ];
+        assert_eq!(code.len() as i32, CODE_WORDS);
+
+        let mut rom = image(&code);
+        rom.extend_from_slice(message);
+
+        let mut bus = Bus::new();
+        bus.map_rom(ROM, rom).unwrap();
+        bus.map_device(CONSOLE, console.clone()).unwrap();
+        let mut m = Machine::new(bus);
+
+        assert_eq!(m.run(200), Err(Trap::Breakpoint { pc: 0x20 }));
+        assert_eq!(console.borrow_mut().take_string(), "hello\n");
     }
 }

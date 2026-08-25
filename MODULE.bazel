@@ -1,15 +1,26 @@
 module(name = "sgsae")
 
-bazel_dep(name = "rules_rust", version = "0.54.1")
-bazel_dep(name = "aspect_rules_js", version = "2.9.2")
-bazel_dep(name = "bazel_skylib", version = "1.9.0")
+bazel_dep(name = "rules_rust", version = "0.73.0")
+bazel_dep(name = "rules_rust_wasm_bindgen", version = "0.73.0")
+bazel_dep(name = "aspect_rules_js", version = "3.4.1")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+bazel_dep(name = "platforms", version = "1.1.0")
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2021",
-    versions = ["1.78.0"],
+    # Naming any triple here replaces the defaults, so the wasm ones the web
+    # build needs have to be listed alongside the guest triple.
+    extra_target_triples = [
+        "wasm32-unknown-unknown",
+        "wasm32-wasip1",
+        # What cartridges are built for; see //platforms:rv32.
+        "riscv32imc-unknown-none-elf",
+    ],
+    versions = ["1.97.1"],
 )
 use_repo(rust, "rust_toolchains")
+
 register_toolchains("@rust_toolchains//:all")
 
 crate = use_extension(
@@ -22,10 +33,6 @@ crate.from_cargo(
     manifests = ["//:Cargo.toml"],
 )
 use_repo(crate, "crates")
-
-register_toolchains("@rules_rust//wasm_bindgen:default_wasm_bindgen_toolchain")
-
-register_toolchains("@rules_rust//rust/private/dummy_cc_toolchain:dummy_cc_wasm32_toolchain")
 
 npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm", dev_dependency = True)
 

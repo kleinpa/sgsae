@@ -1,0 +1,52 @@
+load("@rules_rust//rust:defs.bzl", "rust_test")
+load(":cartridge.bzl", "cartridge_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# The cartridges. Each is guest code: built for //platforms:rv32 by the
+# transition inside `cartridge`, not for the host.
+
+# The supervisor: the program the console starts with and comes back to.
+cartridge_binary(
+    name = "loader",
+    srcs = ["loader.rs"],
+)
+
+# Lunar Lander.
+cartridge_binary(
+    name = "lander",
+    srcs = ["lander.rs"],
+)
+
+# Shows every input the console can see, and sounds a DTMF pair for each press.
+cartridge_binary(
+    name = "io",
+    srcs = ["io.rs"],
+)
+
+# A sixteen-step sequencer driving the FM chip, on its own clock or MIDI's.
+cartridge_binary(
+    name = "seq",
+    srcs = ["seq.rs"],
+)
+
+filegroup(
+    name = "cartridges",
+    srcs = [
+        ":loader",
+        ":io",
+        ":lander",
+        ":seq",
+    ],
+)
+
+# The end-to-end check: build cartridges with the real toolchain, then run them
+# on the emulator. Host-configured, so it depends on them as data and lets the
+# transition handle the guest build.
+rust_test(
+    name = "cartridge_test",
+    srcs = ["cartridge_test.rs"],
+    data = [":cartridges"],
+    edition = "2021",
+    deps = ["//sgsae"],
+)

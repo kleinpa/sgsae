@@ -1,2 +1,9 @@
 startup --windows_enable_symlinks
 build --enable_runfiles
+
+# The browser test runs in the sandbox, which does not inherit the environment.
+# Forward the two variables that say which browser to drive; when they are unset
+# the test falls back to whatever selenium can find for itself, so this is safe
+# on a machine that has Chrome on the PATH instead.
+test --test_env=CHROME_BIN
+test --test_env=CHROMEDRIVER_BIN

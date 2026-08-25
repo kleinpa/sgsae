@@ -1,351 +1,264 @@
-use crate::types::*;
+//! RV32IM instruction encoding and decoding.
+//!
+//! [`Instruction`] is a decoded instruction: every field holds the value the
+//! instruction *means*, not the bits it was stored in. Immediates arrive
+//! already sign-extended to `i32`, branch and jump offsets are byte
+//! displacements from the address of the instruction itself, and `LUI`/`AUIPC`
+//! carry the full 32-bit value rather than the 20-bit field. Nothing
+//! downstream has to remember a shift or an extension rule.
+//!
+//! [`Instruction::decode`] and [`Instruction::encode`] are inverses for every
+//! instruction the decoder recognises, which is checked exhaustively by a
+//! round-trip test over random words.
 
-mod code {
-    use crate::types::*;
+use crate::types::Register;
 
-    // The following types are currently not needed:
-    //   AMOType with 'aqrl' var
-    //   ISHWType with 'shamtw' var
-    //   CsrType
-    //   R4Type with 'rs3' var
+// ---------------------------------------------------------------------------
+// Bitfield primitives
+// ---------------------------------------------------------------------------
 
-    /// Shift a slice of bits from one place in a bitfield to another
-    fn bits<T: Into<u64>>(x: T, fr: u8, mask: u8, to: u8) -> u32 {
-        ((x.into() as u32 >> fr) & ((1 << mask) - 1)) << to
-    }
-
-    // Instruction bitfield access
-    pub fn get_opcode(x: u32) -> u8 {
-        bits(x, 0, 7, 0) as u8
-    }
-    fn set_opcode(x: u8) -> u32 {
-        bits(x, 0, 7, 0)
-    }
-    fn get_funct3(x: u32) -> u8 {
-        bits(x, 12, 3, 0) as u8
-    }
-    fn set_funct3(x: u8) -> u32 {
-        bits(x, 0, 3, 12)
-    }
-    fn get_funct7(x: u32) -> u8 {
-        bits(x, 25, 7, 0) as u8
-    }
-    fn set_funct7(x: u8) -> u32 {
-        bits(x, 0, 7, 25)
-    }
-    fn get_rs1(x: u32) -> Register {
-        bits(x, 15, 5, 0) as Register
-    }
-    fn set_rs1(x: Register) -> u32 {
-        bits(x as u32, 0, 7, 15)
-    }
-    fn get_rs2(x: u32) -> Register {
-        bits(x, 20, 5, 0) as Register
-    }
-    fn set_rs2(x: Register) -> u32 {
-        bits(x as u32, 0, 7, 20)
-    }
-    fn get_rd(x: u32) -> Register {
-        bits(x, 7, 5, 0) as Register
-    }
-    fn set_rd(x: Register) -> u32 {
-        bits(x as u32, 0, 7, 7)
-    }
-    fn get_i_imm(x: u32) -> u16 {
-        bits(x, 20, 12, 0) as u16
-    }
-    fn set_i_imm(x: u16) -> u32 {
-        bits(x as u32, 0, 12, 20)
-    }
-    fn get_s_imm(x: u32) -> u16 {
-        (bits(x, 25, 7, 0) | bits(x, 7, 5, 0)) as u16
-    }
-    fn set_s_imm(x: u16) -> u32 {
-        bits(x as u32, 5, 7, 25) | bits(x as u32, 0, 5, 7)
-    }
-    fn get_b_imm(x: u32) -> u16 {
-        (bits(x, 31, 1, 12) | bits(x, 25, 6, 5) | bits(x, 8, 4, 1) | bits(x, 7, 1, 11)) as u16
-    }
-    fn set_b_imm(x: u16) -> u32 {
-        bits(x, 12, 1, 31) | bits(x, 5, 6, 25) | bits(x, 1, 4, 8) | bits(x, 11, 1, 7)
-    }
-    fn get_u_imm(x: u32) -> u32 {
-        bits(x, 12, 20, 0)
-    }
-    fn set_u_imm(x: u32) -> u32 {
-        bits(x, 0, 20, 12)
-    }
-    fn get_j_imm(x: u32) -> u32 {
-        bits(x, 31, 1, 20) | bits(x, 21, 10, 1) | bits(x, 20, 1, 11) | bits(x, 12, 8, 12)
-    }
-    fn set_j_imm(x: u32) -> u32 {
-        bits(x, 20, 1, 31) | bits(x, 1, 10, 21) | bits(x, 11, 1, 20) | bits(x, 12, 8, 12)
-    }
-
-    pub struct IType {
-        pub funct3: u8,
-        pub rd: Register,
-        pub rs: Register,
-        pub imm: u16,
-    }
-    impl IType {
-        pub fn encode(opcode: u8, funct3: u8, rd: Register, rs: Register, imm: u16) -> u32 {
-            set_i_imm(imm) | set_rs1(rs) | set_funct3(funct3) | set_rd(rd) | set_opcode(opcode)
-        }
-
-        pub fn decode(instruction: u32) -> IType {
-            return IType {
-                funct3: get_funct3(instruction),
-                rd: get_rd(instruction),
-                rs: get_rs1(instruction),
-                imm: get_i_imm(instruction),
-            };
-        }
-    }
-
-    pub struct IshType {
-        pub funct3: u8,
-        pub rd: Register,
-        pub rs: Register,
-        pub shamt: u8,
-        pub ish: u8,
-    }
-    impl IshType {
-        pub fn encode(
-            opcode: u8,
-            funct3: u8,
-            rd: Register,
-            rs: Register,
-            shamt: u8,
-            ish: u8,
-        ) -> u32 {
-            if shamt > 0b11111 {
-                panic!("shamt out of range");
-            }
-            bits(shamt, 0, 5, 20)
-                | bits(ish, 0, 7, 25)
-                | set_rs1(rs)
-                | set_funct3(funct3)
-                | set_rd(rd)
-                | set_opcode(opcode)
-        }
-        pub fn decode(instruction: u32) -> IshType {
-            return IshType {
-                funct3: get_funct3(instruction),
-                rd: get_rd(instruction),
-                rs: get_rs1(instruction),
-                shamt: bits(instruction, 20, 5, 0) as u8,
-                ish: bits(instruction, 25, 7, 0) as u8,
-            };
-        }
-    }
-
-    pub struct RType {
-        pub funct3: u8,
-        pub funct7: u8,
-        pub rd: Register,
-        pub rs1: Register,
-        pub rs2: Register,
-    }
-    impl RType {
-        pub fn decode(instruction: u32) -> RType {
-            return RType {
-                funct3: get_funct3(instruction),
-                funct7: get_funct7(instruction),
-                rd: get_rd(instruction),
-                rs1: get_rs1(instruction),
-                rs2: get_rs2(instruction),
-            };
-        }
-
-        pub fn encode(
-            opcode: u8,
-            funct3: u8,
-            funct7: u8,
-            rd: Register,
-            rs1: Register,
-            rs2: Register,
-        ) -> u32 {
-            set_funct7(funct7)
-                | set_rs2(rs2)
-                | set_rs1(rs1)
-                | set_funct3(funct3)
-                | set_rd(rd)
-                | set_opcode(opcode)
-        }
-    }
-
-    pub struct SType {
-        pub funct3: u8,
-        pub rs1: Register,
-        pub rs2: Register,
-        pub imm: u16,
-    }
-    impl SType {
-        pub fn decode(instruction: u32) -> SType {
-            return SType {
-                funct3: get_funct3(instruction),
-                rs1: get_rs1(instruction),
-                rs2: get_rs2(instruction),
-                imm: get_s_imm(instruction),
-            };
-        }
-
-        pub fn encode(opcode: u8, funct3: u8, rs1: Register, rs2: Register, imm: u16) -> u32 {
-            set_s_imm(imm) | set_rs2(rs2) | set_rs1(rs1) | set_funct3(funct3) | set_opcode(opcode)
-        }
-    }
-
-    pub struct SBType {
-        pub funct3: u8,
-        pub rs1: Register,
-        pub rs2: Register,
-        pub imm: u16,
-    }
-    impl SBType {
-        pub fn decode(instruction: u32) -> SBType {
-            return SBType {
-                funct3: get_funct3(instruction),
-                rs1: get_rs1(instruction),
-                rs2: get_rs2(instruction),
-                imm: get_b_imm(instruction),
-            };
-        }
-
-        pub fn encode(opcode: u8, funct3: u8, rs1: Register, rs2: Register, imm: u16) -> u32 {
-            set_b_imm(imm) | set_rs2(rs2) | set_rs1(rs1) | set_funct3(funct3) | set_opcode(opcode)
-        }
-    }
-
-    pub struct UType {
-        pub rd: Register,
-        pub imm: u32,
-    }
-    impl UType {
-        pub fn decode(instruction: u32) -> UType {
-            return UType { rd: get_rd(instruction), imm: get_u_imm(instruction) };
-        }
-
-        pub fn encode(opcode: u8, rd: Register, imm: u32) -> u32 {
-            set_u_imm(imm) | set_rd(rd) | set_opcode(opcode)
-        }
-    }
-
-    pub struct UJType {
-        pub rd: Register,
-        pub offset: u32,
-    }
-    impl UJType {
-        pub fn decode(instruction: u32) -> UJType {
-            return UJType { rd: get_rd(instruction), offset: get_j_imm(instruction) };
-        }
-        pub fn encode(opcode: u8, rd: Register, imm: u32) -> u32 {
-            set_j_imm(imm) | set_rd(rd) | set_opcode(opcode)
-        }
-    }
-
-    pub struct FenceType {
-        pub funct3: u8,
-        pub pred: u8,
-        pub succ: u8,
-    }
-    impl FenceType {
-        pub fn decode(instruction: u32) -> FenceType {
-            return FenceType {
-                funct3: get_funct3(instruction),
-                pred: bits(instruction, 24, 4, 0) as u8,
-                succ: bits(instruction, 20, 4, 0) as u8,
-            };
-        }
-        pub fn encode(opcode: u8, funct3: u8, pred: u8, succ: u8) -> u32 {
-            return {
-                bits(pred, 0, 4, 24)
-                    | bits(succ, 0, 4, 20)
-                    | set_rs1(0)
-                    | set_funct3(funct3)
-                    | set_rd(0)
-                    | set_opcode(opcode)
-            };
-        }
-    }
+/// Extract `len` bits starting at bit `lo`.
+pub(crate) const fn field(x: u32, lo: u32, len: u32) -> u32 {
+    (x >> lo) & ((1u32 << len) - 1)
 }
-use code::*;
 
-#[derive(Debug, PartialEq)]
+/// Sign-extend the low `len` bits of `x` to a full `i32`.
+///
+/// Every immediate in the ISA goes through here with its true width, which is
+/// the whole reason the extension rules cannot drift apart between formats.
+pub(crate) const fn sext(x: u32, len: u32) -> i32 {
+    let shift = 32 - len;
+    ((x << shift) as i32) >> shift
+}
 
+const fn opcode_of(x: u32) -> u32 {
+    field(x, 0, 7)
+}
+const fn funct3(x: u32) -> u32 {
+    field(x, 12, 3)
+}
+const fn funct7(x: u32) -> u32 {
+    field(x, 25, 7)
+}
+const fn rd(x: u32) -> Register {
+    field(x, 7, 5) as Register
+}
+const fn rs1(x: u32) -> Register {
+    field(x, 15, 5) as Register
+}
+const fn rs2(x: u32) -> Register {
+    field(x, 20, 5) as Register
+}
+const fn shamt(x: u32) -> u32 {
+    field(x, 20, 5)
+}
+
+// Immediate reassembly. Each mirrors a figure in the ISA manual directly:
+// the bit positions on the left are where the value's bits live in the word.
+
+/// I-type: `imm[11:0] = inst[31:20]`.
+const fn i_imm(x: u32) -> i32 {
+    sext(field(x, 20, 12), 12)
+}
+
+/// S-type: `imm[11:5] = inst[31:25]`, `imm[4:0] = inst[11:7]`.
+const fn s_imm(x: u32) -> i32 {
+    sext((field(x, 25, 7) << 5) | field(x, 7, 5), 12)
+}
+
+/// B-type: 13-bit, always even. `imm[12|10:5]` in `inst[31:25]`,
+/// `imm[4:1|11]` in `inst[11:7]`.
+const fn b_imm(x: u32) -> i32 {
+    let bits = (field(x, 31, 1) << 12)
+        | (field(x, 7, 1) << 11)
+        | (field(x, 25, 6) << 5)
+        | (field(x, 8, 4) << 1);
+    sext(bits, 13)
+}
+
+/// U-type: `imm[31:12] = inst[31:12]`, low 12 bits zero. Already a full value.
+const fn u_imm(x: u32) -> i32 {
+    (x & 0xFFFF_F000) as i32
+}
+
+/// J-type: 21-bit, always even. `imm[20|10:1|11|19:12]` in `inst[31:12]`.
+const fn j_imm(x: u32) -> i32 {
+    let bits = (field(x, 31, 1) << 20)
+        | (field(x, 12, 8) << 12)
+        | (field(x, 20, 1) << 11)
+        | (field(x, 21, 10) << 1);
+    sext(bits, 21)
+}
+
+// Encoders, mirroring the decoders above.
+
+const fn enc_r(opcode: u32, f3: u32, f7: u32, rd: Register, rs1: Register, rs2: Register) -> u32 {
+    (f7 << 25)
+        | ((rs2 as u32 & 0x1F) << 20)
+        | ((rs1 as u32 & 0x1F) << 15)
+        | (f3 << 12)
+        | ((rd as u32 & 0x1F) << 7)
+        | opcode
+}
+
+const fn enc_i(opcode: u32, f3: u32, rd: Register, rs1: Register, imm: i32) -> u32 {
+    (((imm as u32) & 0xFFF) << 20)
+        | ((rs1 as u32 & 0x1F) << 15)
+        | (f3 << 12)
+        | ((rd as u32 & 0x1F) << 7)
+        | opcode
+}
+
+const fn enc_ish(opcode: u32, f3: u32, f7: u32, rd: Register, rs1: Register, shamt: u32) -> u32 {
+    (f7 << 25)
+        | ((shamt & 0x1F) << 20)
+        | ((rs1 as u32 & 0x1F) << 15)
+        | (f3 << 12)
+        | ((rd as u32 & 0x1F) << 7)
+        | opcode
+}
+
+const fn enc_s(opcode: u32, f3: u32, rs1: Register, rs2: Register, imm: i32) -> u32 {
+    let i = imm as u32;
+    (((i >> 5) & 0x7F) << 25)
+        | ((rs2 as u32 & 0x1F) << 20)
+        | ((rs1 as u32 & 0x1F) << 15)
+        | (f3 << 12)
+        | ((i & 0x1F) << 7)
+        | opcode
+}
+
+const fn enc_b(opcode: u32, f3: u32, rs1: Register, rs2: Register, imm: i32) -> u32 {
+    let i = imm as u32;
+    (((i >> 12) & 1) << 31)
+        | (((i >> 5) & 0x3F) << 25)
+        | ((rs2 as u32 & 0x1F) << 20)
+        | ((rs1 as u32 & 0x1F) << 15)
+        | (f3 << 12)
+        | (((i >> 1) & 0xF) << 8)
+        | (((i >> 11) & 1) << 7)
+        | opcode
+}
+
+const fn enc_u(opcode: u32, rd: Register, imm: i32) -> u32 {
+    ((imm as u32) & 0xFFFF_F000) | ((rd as u32 & 0x1F) << 7) | opcode
+}
+
+const fn enc_j(opcode: u32, rd: Register, imm: i32) -> u32 {
+    let i = imm as u32;
+    (((i >> 20) & 1) << 31)
+        | (((i >> 1) & 0x3FF) << 21)
+        | (((i >> 11) & 1) << 20)
+        | (((i >> 12) & 0xFF) << 12)
+        | ((rd as u32 & 0x1F) << 7)
+        | opcode
+}
+
+// ---------------------------------------------------------------------------
+// Opcodes
+// ---------------------------------------------------------------------------
+
+const OP_LOAD: u32 = 0b000_0011;
+const OP_FENCE: u32 = 0b000_1111;
+const OP_IMM: u32 = 0b001_0011;
+const OP_AUIPC: u32 = 0b001_0111;
+const OP_STORE: u32 = 0b010_0011;
+const OP_REG: u32 = 0b011_0011;
+const OP_LUI: u32 = 0b011_0111;
+const OP_BRANCH: u32 = 0b110_0011;
+const OP_JALR: u32 = 0b110_0111;
+const OP_JAL: u32 = 0b110_1111;
+const OP_SYSTEM: u32 = 0b111_0011;
+
+/// `funct7` marking the "alternate" form of an op: SUB, SRA, SRAI.
+const ALT: u32 = 0b010_0000;
+/// `funct7` marking the M extension.
+const MULDIV: u32 = 0b000_0001;
+
+// ---------------------------------------------------------------------------
+// Instruction
+// ---------------------------------------------------------------------------
+
+/// A decoded RV32IM instruction.
+///
+/// `offset` fields on `JAL` and the branches are relative to the address of
+/// *that instruction*, matching the ISA. `imm` on `LUI` and `AUIPC` is the
+/// full 32-bit value, already shifted left by 12.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[rustfmt::skip]
 pub enum Instruction {
-    /// Upper Immediate
-    LUI { rd: Register, imm: u32 },
-    /// Add Upper Immediate to PC
-    AUIPC { rd: Register, offset: u32 },
-    /// Jump and Link
+    // -- RV32I: upper immediates and jumps -----------------------------------
+    /// Load Upper Immediate: `rd ← imm`
+    LUI { rd: Register, imm: i32 },
+    /// Add Upper Immediate to PC: `rd ← pc + imm`
+    AUIPC { rd: Register, imm: i32 },
+    /// Jump and Link: `rd ← pc + 4; pc ← pc + offset`
     JAL { rd: Register, offset: i32 },
-    /// Jump and Link Register
-    JALR { rd: Register, rs: Register, offset: i16 },
-    /// Branch Equal
-    BEQ { rs1: Register, rs2: Register, offset: i16 },
-    /// Branch Not Equal
-    BNE { rs1: Register, rs2: Register, offset: i16 },
-    /// Branch Less Than
-    BLT { rs1: Register, rs2: Register, offset: i16 },
-    /// Branch Greater than Equal
-    BGE { rs1: Register, rs2: Register, offset: i16 },
-    /// Branch Less Than Unsigned
-    BLTU { rs1: Register, rs2: Register, offset: i16 },
-    /// Branch Greater than Equal Unsigned
-    BGEU { rs1: Register, rs2: Register, offset: i16 },
-    /// Load Byte
-    LB { rs: Register, rd: Register, offset: i16 },
-    /// Load Half
-    LH { rs: Register, rd: Register, offset: i16 },
+    /// Jump and Link Register: `rd ← pc + 4; pc ← (rs1 + offset) & !1`
+    JALR { rd: Register, rs1: Register, offset: i32 },
+
+    // -- RV32I: branches -----------------------------------------------------
+    /// Branch if Equal
+    BEQ { rs1: Register, rs2: Register, offset: i32 },
+    /// Branch if Not Equal
+    BNE { rs1: Register, rs2: Register, offset: i32 },
+    /// Branch if Less Than (signed)
+    BLT { rs1: Register, rs2: Register, offset: i32 },
+    /// Branch if Greater or Equal (signed)
+    BGE { rs1: Register, rs2: Register, offset: i32 },
+    /// Branch if Less Than (unsigned)
+    BLTU { rs1: Register, rs2: Register, offset: i32 },
+    /// Branch if Greater or Equal (unsigned)
+    BGEU { rs1: Register, rs2: Register, offset: i32 },
+
+    // -- RV32I: loads and stores ---------------------------------------------
+    /// Load Byte, sign-extended
+    LB { rd: Register, rs1: Register, offset: i32 },
+    /// Load Half, sign-extended
+    LH { rd: Register, rs1: Register, offset: i32 },
     /// Load Word
-    LW { rs: Register, rd: Register, offset: i16 },
-    /// Load Double
-    LD { rs: Register, rd: Register, offset: i16 },
-    /// Load Word Unsigned
-    LWU { rs: Register, rd: Register, offset: i16 },
-    /// Load Byte Unsigned
-    LBU { rs: Register, rd: Register, offset: i16 },
-    /// Load Half Unsigned
-    LHU { rs: Register, rd: Register, offset: i16 },
+    LW { rd: Register, rs1: Register, offset: i32 },
+    /// Load Byte, zero-extended
+    LBU { rd: Register, rs1: Register, offset: i32 },
+    /// Load Half, zero-extended
+    LHU { rd: Register, rs1: Register, offset: i32 },
     /// Store Byte
-    SB { rs1: Register, rs2: Register, offset: i16 },
+    SB { rs1: Register, rs2: Register, offset: i32 },
     /// Store Half
-    SH { rs1: Register, rs2: Register, offset: i16 },
+    SH { rs1: Register, rs2: Register, offset: i32 },
     /// Store Word
-    SW { rs1: Register, rs2: Register, offset: i16 },
-    /// Store Double
-    SD { rs1: Register, rs2: Register, offset: i16 },
+    SW { rs1: Register, rs2: Register, offset: i32 },
+
+    // -- RV32I: register-immediate -------------------------------------------
     /// Add Immediate
-    ADDI { rd: Register, rs: Register, imm: i16 },
-    /// Set Less Than Immediate
-    SLTI { rd: Register, rs: Register, imm: i16 },
-    /// Set Less Than Immediate Unsigned
-    SLTIU { rd: Register, rs: Register, imm: u16 },
+    ADDI { rd: Register, rs1: Register, imm: i32 },
+    /// Set Less Than Immediate (signed)
+    SLTI { rd: Register, rs1: Register, imm: i32 },
+    /// Set Less Than Immediate (unsigned comparison, sign-extended immediate)
+    SLTIU { rd: Register, rs1: Register, imm: i32 },
     /// Xor Immediate
-    XORI { rd: Register, rs: Register, imm: u16 },
+    XORI { rd: Register, rs1: Register, imm: i32 },
     /// Or Immediate
-    ORI { rd: Register, rs: Register, imm: u16 },
+    ORI { rd: Register, rs1: Register, imm: i32 },
     /// And Immediate
-    ANDI { rd: Register, rs: Register, imm: u16 },
+    ANDI { rd: Register, rs1: Register, imm: i32 },
     /// Shift Left Logical Immediate
-    SLLI { rd: Register, rs: Register, imm: u8 },
+    SLLI { rd: Register, rs1: Register, shamt: u32 },
     /// Shift Right Logical Immediate
-    SRLI { rd: Register, rs: Register, imm: u8 },
+    SRLI { rd: Register, rs1: Register, shamt: u32 },
     /// Shift Right Arithmetic Immediate
-    SRAI { rd: Register, rs: Register, imm: u8 },
-    /// Add Immediate Word
-    ADDIW { rd: Register, rs: Register, imm: i16 },
+    SRAI { rd: Register, rs1: Register, shamt: u32 },
+
+    // -- RV32I: register-register --------------------------------------------
     /// Add
     ADD { rd: Register, rs1: Register, rs2: Register },
     /// Subtract
     SUB { rd: Register, rs1: Register, rs2: Register },
     /// Shift Left Logical
     SLL { rd: Register, rs1: Register, rs2: Register },
-    /// Set Less Than
+    /// Set Less Than (signed)
     SLT { rd: Register, rs1: Register, rs2: Register },
-    /// Set Less Than Unsigned
+    /// Set Less Than (unsigned)
     SLTU { rd: Register, rs1: Register, rs2: Register },
     /// Xor
     XOR { rd: Register, rs1: Register, rs2: Register },
@@ -357,317 +270,484 @@ pub enum Instruction {
     OR { rd: Register, rs1: Register, rs2: Register },
     /// And
     AND { rd: Register, rs1: Register, rs2: Register },
-    /// Shift Left Logical Immediate Word
-    SLLIW { rd: Register, rs: Register, imm: u8 },
-    /// Shift Right Logical Immediate Word
-    SRLIW { rd: Register, rs: Register, imm: u8 },
-    /// Shift Right Arithmetic Immediate Word
-    SRAIW { rd: Register, rs: Register, imm: u8 },
-    /// Add Word
-    ADDW { rd: Register, rs1: Register, rs2: Register },
-    /// Subtract Word
-    SUBW { rd: Register, rs1: Register, rs2: Register },
-    /// Shift Left Logical Word
-    SLLW { rd: Register, rs1: Register, rs2: Register },
-    /// Shift Right Logical Word
-    SRLW { rd: Register, rs1: Register, rs2: Register },
-    /// Shift Right Arithmetic Word
-    SRAW { rd: Register, rs1: Register, rs2: Register },
+
+    // -- RV32M ---------------------------------------------------------------
+    /// Multiply, low word
+    MUL { rd: Register, rs1: Register, rs2: Register },
+    /// Multiply, high word (signed × signed)
+    MULH { rd: Register, rs1: Register, rs2: Register },
+    /// Multiply, high word (signed × unsigned)
+    MULHSU { rd: Register, rs1: Register, rs2: Register },
+    /// Multiply, high word (unsigned × unsigned)
+    MULHU { rd: Register, rs1: Register, rs2: Register },
+    /// Divide (signed)
+    DIV { rd: Register, rs1: Register, rs2: Register },
+    /// Divide (unsigned)
+    DIVU { rd: Register, rs1: Register, rs2: Register },
+    /// Remainder (signed)
+    REM { rd: Register, rs1: Register, rs2: Register },
+    /// Remainder (unsigned)
+    REMU { rd: Register, rs1: Register, rs2: Register },
+
+    // -- Memory ordering and system ------------------------------------------
     /// Fence
     FENCE { pred: u8, succ: u8 },
-    /// Fence Instruction
-    FENCEI {},
+    /// Fence Instruction Stream
+    FENCEI,
     /// Environment Call
-    ECALL {},
-    /// Environment Break
-    EBREAK {},
+    ECALL,
+    /// Environment Breakpoint
+    EBREAK,
     /// CSR Read and Write
-    CSRRW { rs:  Register, rd: Register, csr: u16 },
+    CSRRW { rd: Register, rs1: Register, csr: u16 },
     /// CSR Read and Set Bits
-    CSRRS { rs:  Register, rd: Register, csr: u16 },
+    CSRRS { rd: Register, rs1: Register, csr: u16 },
     /// CSR Read and Clear Bits
-    CSRRC { rs:  Register, rd: Register, csr: u16 },
-    /// CSR Read and Write bits Immediate
-    CSRRWI { zimm: u8, rd: Register, csr: u16 },
-    /// CSR Read and Set bits Immediate
-    CSRRSI { zimm: u8, rd: Register, csr: u16 },
-    /// CSR Read and Clear Immediate
-    CSRRCI { zimm: u8, rd: Register, csr: u16 },
+    CSRRC { rd: Register, rs1: Register, csr: u16 },
+    /// CSR Read and Write Immediate
+    CSRRWI { rd: Register, zimm: u32, csr: u16 },
+    /// CSR Read and Set Bits Immediate
+    CSRRSI { rd: Register, zimm: u32, csr: u16 },
+    /// CSR Read and Clear Bits Immediate
+    CSRRCI { rd: Register, zimm: u32, csr: u16 },
 
-    UNKNOWN { instruction: u32 },
+    /// Not a recognised RV32IM encoding.
+    UNKNOWN { word: u32 },
 }
 
-#[rustfmt::skip]
 impl Instruction {
-
-    /// Decode a binary instruction into a struct. Sign extend to native type where appropriate.
+    /// Decode one 32-bit instruction word.
+    ///
+    /// Anything not in RV32IM comes back as [`Instruction::UNKNOWN`]; the CPU
+    /// turns that into an illegal-instruction trap.
+    #[rustfmt::skip]
     pub fn decode(x: u32) -> Instruction {
-        /// Sign extend 11-bit int to i16
-        fn se11(x: u16) -> i16 {
-            (x.wrapping_shl(5) as i16).wrapping_shr(5)
-        }
-        /// Sign extend 12-bit int to i16
-        fn se12(x: u16) -> i16 {
-            (x.wrapping_shl(4) as i16).wrapping_shr(4)
-        }
-        /// Sign extend 20-bit int to i32
-        fn se20(x: u32) -> i32 {
-            (x.wrapping_shl(12) as i32).wrapping_shr(12)
-        }
-        match get_opcode(x) {
-            0b0000011 => match IType::decode(x) {
-                code::IType { funct3: 0b000, rd, rs, imm } => Instruction::LB { rd: rd, rs: rs, offset: se12(imm) },
-                code::IType { funct3: 0b001, rd, rs, imm } => Instruction::LH { rd: rd, rs: rs, offset: se12(imm) },
-                code::IType { funct3: 0b010, rd, rs, imm } => Instruction::LW { rd: rd, rs: rs, offset: se12(imm) },
-                code::IType { funct3: 0b011, rd, rs, imm } => Instruction::LD { rd: rd, rs: rs, offset: se12(imm) },
-                code::IType { funct3: 0b100, rd, rs, imm } => Instruction::LBU { rd: rd, rs: rs, offset: se12(imm) },
-                code::IType { funct3: 0b101, rd, rs, imm } => Instruction::LHU { rd: rd, rs: rs, offset: se12(imm) },
-                code::IType { funct3: 0b110, rd, rs, imm } => Instruction::LWU { rd: rd, rs: rs, offset: se12(imm) },
-                _ => Instruction::UNKNOWN { instruction: x },
+        use Instruction as I;
+        let unknown = I::UNKNOWN { word: x };
+
+        match opcode_of(x) {
+            OP_LUI => I::LUI { rd: rd(x), imm: u_imm(x) },
+            OP_AUIPC => I::AUIPC { rd: rd(x), imm: u_imm(x) },
+            OP_JAL => I::JAL { rd: rd(x), offset: j_imm(x) },
+
+            OP_JALR => match funct3(x) {
+                0b000 => I::JALR { rd: rd(x), rs1: rs1(x), offset: i_imm(x) },
+                _ => unknown,
             },
-            0b0010011 => match IType::decode(x) {
-                code::IType { funct3: 0b000, rd, rs, imm } => Instruction::ADDI { rd: rd, rs: rs, imm: se11(imm) },
-                code::IType { funct3: 0b001, .. } => match IshType::decode(x) {
-                    code::IshType { ish: 0b0000000, rd, rs, shamt, .. } => Instruction::SLLI { rd: rd, rs: rs, imm: shamt },
-                    _  => Instruction::UNKNOWN { instruction: x },
+
+            OP_BRANCH => {
+                let (rs1, rs2, offset) = (rs1(x), rs2(x), b_imm(x));
+                match funct3(x) {
+                    0b000 => I::BEQ { rs1, rs2, offset },
+                    0b001 => I::BNE { rs1, rs2, offset },
+                    0b100 => I::BLT { rs1, rs2, offset },
+                    0b101 => I::BGE { rs1, rs2, offset },
+                    0b110 => I::BLTU { rs1, rs2, offset },
+                    0b111 => I::BGEU { rs1, rs2, offset },
+                    _ => unknown,
                 }
-                code::IType { funct3: 0b010, rd, rs, imm } => Instruction::SLTI { rd: rd, rs: rs, imm: se11(imm) },
-                code::IType { funct3: 0b011, rd, rs, imm } => Instruction::SLTIU { rd: rd, rs: rs, imm: imm },
-                code::IType { funct3: 0b100, rd, rs, imm } => Instruction::XORI { rd: rd, rs: rs, imm: imm },
-                code::IType { funct3: 0b101, .. } => match IshType::decode(x) {
-                    code::IshType { ish: 0b0000000, shamt, rs, rd, .. } => Instruction::SRLI { rd: rd, rs: rs, imm: shamt },
-                    code::IshType { ish: 0b0100000, shamt, rs, rd, .. } => Instruction::SRAI { rd: rd, rs: rs, imm: shamt },
-                    _  => Instruction::UNKNOWN { instruction: x },
-                }
-                code::IType { funct3: 0b110, rd, rs, imm } => Instruction::ORI { rd: rd, rs: rs, imm: imm },
-                code::IType { funct3: 0b111, rd, rs, imm } => Instruction::ANDI { rd: rd, rs: rs, imm: imm },
-                _  => Instruction::UNKNOWN { instruction: x },
-            },
-            0b0011011 => match IType::decode(x) {
-                code::IType { funct3: 0b000, rd, rs, imm } => Instruction::ADDIW { imm: se11(imm), rs: rs, rd: rd },
-                code::IType { funct3: 0b001, .. } => match IshType::decode(x) {
-                     code::IshType { ish: 0b0000000, shamt, rs, rd, .. } => Instruction::SLLIW { imm: shamt, rs: rs, rd: rd }, // assert shamt[5]==0
-                     _  => Instruction::UNKNOWN { instruction: x },
-                }
-                code::IType { funct3: 0b101, .. } => match IshType::decode(x) {
-                     code::IshType { ish: 0b0000000, shamt, rs, rd, .. } => Instruction::SRLIW { imm: shamt, rs: rs, rd: rd },// assert shamt[5]==0
-                     code::IshType { ish: 0b0100000, shamt, rs, rd, .. } => Instruction::SRAIW { imm: shamt, rs: rs, rd: rd },// assert shamt[5]==0
-                     _  => Instruction::UNKNOWN { instruction: x },
-                }
-                _  => Instruction::UNKNOWN { instruction: x },
-            },
-            0b1100111 => match IType::decode(x) {
-                code::IType { funct3: 0b000, rd, rs, imm } => Instruction::JALR  { rd: rd, rs: rs, offset: se11(imm) },
-                 _  => Instruction::UNKNOWN { instruction: x },
-            },
-            0b0110011 => match RType::decode(x) {
-                code::RType { funct3: 0b000, funct7: 0b0000000, rd, rs1, rs2 } => Instruction::ADD { rs1: rs1, rs2: rs2, rd: rd },
-                code::RType { funct3: 0b000, funct7: 0b0100000, rd, rs1, rs2 } => Instruction::SUB { rs1: rs1, rs2: rs2, rd: rd },
-                code::RType { funct3: 0b001, funct7: 0b0000000, rd, rs1, rs2 } => Instruction::SLL { rs1: rs1, rs2: rs2, rd: rd },
-                code::RType { funct3: 0b010, funct7: 0b0000000, rd, rs1, rs2 } => Instruction::SLT { rs1: rs1, rs2: rs2, rd: rd },
-                code::RType { funct3: 0b011, funct7: 0b0000000, rd, rs1, rs2 } => Instruction::SLTU { rs1: rs1, rs2: rs2, rd: rd },
-                code::RType { funct3: 0b100, funct7: 0b0000000, rd, rs1, rs2 } => Instruction::XOR { rs1: rs1, rs2: rs2, rd: rd },
-                code::RType { funct3: 0b101, funct7: 0b0000000, rd, rs1, rs2 } => Instruction::SRL { rs1: rs1, rs2: rs2, rd: rd },
-                code::RType { funct3: 0b101, funct7: 0b0100000, rd, rs1, rs2 } => Instruction::SRA { rs1: rs1, rs2: rs2, rd: rd },
-                code::RType { funct3: 0b110, funct7: 0b0000000, rd, rs1, rs2 } => Instruction::OR { rs1: rs1, rs2: rs2, rd: rd },
-                code::RType { funct3: 0b111, funct7: 0b0000000, rd, rs1, rs2 } => Instruction::AND { rs1: rs1, rs2: rs2, rd: rd },
-                _ => Instruction::UNKNOWN { instruction: x },
-            },
-            0b0111011 => match RType::decode(x) {
-                code::RType { funct3: 0b000, funct7: 0b0000000, rd, rs1, rs2 } => Instruction::ADDW { rs1: rs1, rs2: rs2, rd: rd },
-                code::RType { funct3: 0b000, funct7: 0b0100000, rd, rs1, rs2 } => Instruction::SUBW { rs1: rs1, rs2: rs2, rd: rd },
-                code::RType { funct3: 0b001, funct7: 0b0000000, rd, rs1, rs2 } => Instruction::SLLW { rs1: rs1, rs2: rs2, rd: rd },
-                code::RType { funct3: 0b101, funct7: 0b0000000, rd, rs1, rs2 } => Instruction::SRLW { rs1: rs1, rs2: rs2, rd: rd },
-                code::RType { funct3: 0b101, funct7: 0b0100000, rd, rs1, rs2 } => Instruction::SRAW { rs1: rs1, rs2: rs2, rd: rd },
-                _ => Instruction::UNKNOWN { instruction: x },
-            },
-            0b0100011 => match SType::decode(x) {
-                code::SType { funct3: 0b000, rs1, rs2, imm } => Instruction::SB { rs1: rs1, rs2: rs2, offset: se12(imm) },
-                code::SType { funct3: 0b001, rs1, rs2, imm } => Instruction::SH { rs1: rs1, rs2: rs2, offset: se12(imm) },
-                code::SType { funct3: 0b010, rs1, rs2, imm } => Instruction::SW { rs1: rs1, rs2: rs2, offset: se12(imm) },
-                code::SType { funct3: 0b011, rs1, rs2, imm } => Instruction::SD { rs1: rs1, rs2: rs2, offset: se12(imm) },
-                _ => Instruction::UNKNOWN { instruction: x },
-            },
-            0b1100011 => match SBType::decode(x) {
-                code::SBType { funct3: 0b000, rs1, rs2, imm } => Instruction::BEQ { rs1: rs1, rs2: rs2, offset: se12(imm) },
-                code::SBType { funct3: 0b001, rs1, rs2, imm } => Instruction::BNE { rs1: rs1, rs2: rs2, offset: se12(imm) },
-                code::SBType { funct3: 0b100, rs1, rs2, imm } => Instruction::BLT { rs1: rs1, rs2: rs2, offset: se12(imm) },
-                code::SBType { funct3: 0b101, rs1, rs2, imm } => Instruction::BGE { rs1: rs1, rs2: rs2, offset: se12(imm) },
-                code::SBType { funct3: 0b110, rs1, rs2, imm } => Instruction::BLTU { rs1: rs1, rs2: rs2, offset: se12(imm) },
-                code::SBType { funct3: 0b111, rs1, rs2, imm } => Instruction::BGEU { rs1: rs1, rs2: rs2, offset: se12(imm) },
-                _ => Instruction::UNKNOWN { instruction: x },
-            },
-            0b0010111 => match UType::decode(x) {
-                code::UType { rd, imm } => Instruction::AUIPC { rd: rd, offset: imm },
             }
-            0b0110111 => match UType::decode(x) {
-                code::UType { rd, imm } => Instruction::LUI { rd: rd, imm: imm },
+
+            OP_LOAD => {
+                let (rd, rs1, offset) = (rd(x), rs1(x), i_imm(x));
+                match funct3(x) {
+                    0b000 => I::LB { rd, rs1, offset },
+                    0b001 => I::LH { rd, rs1, offset },
+                    0b010 => I::LW { rd, rs1, offset },
+                    0b100 => I::LBU { rd, rs1, offset },
+                    0b101 => I::LHU { rd, rs1, offset },
+                    _ => unknown,
+                }
             }
-            0b1101111 => match UJType::decode(x) {
-                code::UJType {rd, offset} => Instruction::JAL { rd: rd, offset: se20(offset) },
+
+            OP_STORE => {
+                let (rs1, rs2, offset) = (rs1(x), rs2(x), s_imm(x));
+                match funct3(x) {
+                    0b000 => I::SB { rs1, rs2, offset },
+                    0b001 => I::SH { rs1, rs2, offset },
+                    0b010 => I::SW { rs1, rs2, offset },
+                    _ => unknown,
+                }
             }
-            0b0001111 => match FenceType::decode(x) {
-                code::FenceType {funct3: 0b000, pred, succ } => Instruction::FENCE { pred: pred, succ: succ},
-                code::FenceType {funct3: 0b001, pred: 0, succ: 0 } => Instruction::FENCEI {  },
-                _ => Instruction::UNKNOWN { instruction: x },
+
+            OP_IMM => {
+                let (rd, rs1, imm) = (rd(x), rs1(x), i_imm(x));
+                match (funct3(x), funct7(x)) {
+                    (0b000, _) => I::ADDI { rd, rs1, imm },
+                    (0b010, _) => I::SLTI { rd, rs1, imm },
+                    (0b011, _) => I::SLTIU { rd, rs1, imm },
+                    (0b100, _) => I::XORI { rd, rs1, imm },
+                    (0b110, _) => I::ORI { rd, rs1, imm },
+                    (0b111, _) => I::ANDI { rd, rs1, imm },
+                    // On RV32 the shift amount is 5 bits and the remaining 7
+                    // select the variant; any other value is not an encoding.
+                    (0b001, 0) => I::SLLI { rd, rs1, shamt: shamt(x) },
+                    (0b101, 0) => I::SRLI { rd, rs1, shamt: shamt(x) },
+                    (0b101, ALT) => I::SRAI { rd, rs1, shamt: shamt(x) },
+                    _ => unknown,
+                }
+            }
+
+            OP_REG => {
+                let (rd, rs1, rs2) = (rd(x), rs1(x), rs2(x));
+                match (funct3(x), funct7(x)) {
+                    (0b000, 0) => I::ADD { rd, rs1, rs2 },
+                    (0b000, ALT) => I::SUB { rd, rs1, rs2 },
+                    (0b001, 0) => I::SLL { rd, rs1, rs2 },
+                    (0b010, 0) => I::SLT { rd, rs1, rs2 },
+                    (0b011, 0) => I::SLTU { rd, rs1, rs2 },
+                    (0b100, 0) => I::XOR { rd, rs1, rs2 },
+                    (0b101, 0) => I::SRL { rd, rs1, rs2 },
+                    (0b101, ALT) => I::SRA { rd, rs1, rs2 },
+                    (0b110, 0) => I::OR { rd, rs1, rs2 },
+                    (0b111, 0) => I::AND { rd, rs1, rs2 },
+
+                    (0b000, MULDIV) => I::MUL { rd, rs1, rs2 },
+                    (0b001, MULDIV) => I::MULH { rd, rs1, rs2 },
+                    (0b010, MULDIV) => I::MULHSU { rd, rs1, rs2 },
+                    (0b011, MULDIV) => I::MULHU { rd, rs1, rs2 },
+                    (0b100, MULDIV) => I::DIV { rd, rs1, rs2 },
+                    (0b101, MULDIV) => I::DIVU { rd, rs1, rs2 },
+                    (0b110, MULDIV) => I::REM { rd, rs1, rs2 },
+                    (0b111, MULDIV) => I::REMU { rd, rs1, rs2 },
+                    _ => unknown,
+                }
+            }
+
+            OP_FENCE => match (funct3(x), rd(x), rs1(x)) {
+                (0b000, 0, 0) => {
+                    I::FENCE { pred: field(x, 24, 4) as u8, succ: field(x, 20, 4) as u8 }
+                }
+                (0b001, 0, 0) if field(x, 20, 12) == 0 => I::FENCEI,
+                _ => unknown,
             },
-            0b1110011 => match IType::decode(x) {
-                code::IType { funct3: 0b000, rd: 0, rs: 0, imm: 0 } => Instruction::ECALL {},
-                code::IType { funct3: 0b000, rd: 0, rs: 0, imm: 1 } => Instruction::EBREAK {},
-                code::IType { funct3: 0b001, rd, rs, imm } => Instruction::CSRRW { rd: rd, rs: rs, csr: imm },
-                code::IType { funct3: 0b010, rd, rs, imm } => Instruction::CSRRS { rd: rd, rs: rs, csr: imm },
-                code::IType { funct3: 0b011, rd, rs, imm } => Instruction::CSRRC { rd: rd, rs: rs, csr: imm },
-                code::IType { funct3: 0b101, rd, rs, imm } => Instruction::CSRRWI { rd: rd, zimm: rs, csr: imm },
-                code::IType { funct3: 0b110, rd, rs, imm } => Instruction::CSRRSI { rd: rd, zimm: rs, csr: imm },
-                code::IType { funct3: 0b111, rd, rs, imm } => Instruction::CSRRCI { rd: rd, zimm: rs, csr: imm },
-                _ => Instruction::UNKNOWN { instruction: x },
-            },
-            _ => Instruction::UNKNOWN { instruction: x },
+
+            OP_SYSTEM => {
+                let (rd, rs1, csr) = (rd(x), rs1(x), field(x, 20, 12) as u16);
+                let zimm = u32::from(rs1);
+                match funct3(x) {
+                    0b000 => match (x, rd, rs1) {
+                        (_, 0, 0) if csr == 0 => I::ECALL,
+                        (_, 0, 0) if csr == 1 => I::EBREAK,
+                        _ => unknown,
+                    },
+                    0b001 => I::CSRRW { rd, rs1, csr },
+                    0b010 => I::CSRRS { rd, rs1, csr },
+                    0b011 => I::CSRRC { rd, rs1, csr },
+                    0b101 => I::CSRRWI { rd, zimm, csr },
+                    0b110 => I::CSRRSI { rd, zimm, csr },
+                    0b111 => I::CSRRCI { rd, zimm, csr },
+                    _ => unknown,
+                }
+            }
+
+            _ => unknown,
         }
     }
 
+    /// Encode back to a 32-bit instruction word.
+    ///
+    /// In debug builds, out-of-range immediates and misaligned branch targets
+    /// assert rather than silently truncating.
+    #[rustfmt::skip]
     pub fn encode(&self) -> u32 {
-        match self {
-            Instruction::LB { rd, offset, rs } => IType::encode(0b0000011, 0b000, *rd, *rs, *offset as u16),
-            Instruction::LH { rd, offset, rs } => IType::encode(0b0000011, 0b001, *rd, *rs, *offset as u16),
-            Instruction::LW { rd, offset, rs } => IType::encode(0b0000011, 0b010, *rd, *rs, *offset as u16),
-            Instruction::LD { rd, offset, rs } => IType::encode(0b0000011, 0b011, *rd, *rs, *offset as u16),
-            Instruction::LBU { rd, offset, rs } => IType::encode(0b0000011, 0b100, *rd, *rs, *offset as u16),
-            Instruction::LHU { rd, offset, rs } => IType::encode(0b0000011, 0b101, *rd, *rs, *offset as u16),
-            Instruction::LWU { rd, offset, rs } => IType::encode(0b0000011, 0b110, *rd, *rs, *offset as u16),
-            Instruction::ADDI { rd, rs, imm } => IType::encode(0b0010011, 0b000, *rd, *rs, *imm as u16),
-            Instruction::SLLI { rd, rs, imm } => IshType::encode(0b0010011, 0b001, *rd, *rs, *imm, 0),
-            Instruction::SLTI { rd, rs, imm } => IType::encode(0b0010011, 0b010, *rd, *rs, *imm as u16),
-            Instruction::SLTIU { rd, rs, imm } => IType::encode(0b0010011, 0b011, *rd, *rs, *imm),
-            Instruction::XORI { rd, rs, imm } => IType::encode(0b0010011, 0b100, *rd, *rs, *imm),
-            Instruction::SRLI { rd, rs, imm } => IshType::encode(0b0010011, 0b101, *rd, *rs, *imm, 0),
-            Instruction::SRAI { rd, rs, imm } => IshType::encode(0b0010011, 0b101, *rd, *rs, *imm, 0b0100000),
-            Instruction::ORI { rd, rs, imm } => IType::encode(0b0010011, 0b110, *rd, *rs, *imm),
-            Instruction::ANDI { rd, rs, imm } => IType::encode(0b0010011, 0b111, *rd, *rs, *imm),
-            Instruction::ADDIW { rd, rs, imm } => IType::encode(0b0011011, 0b000, *rd, *rs, *imm as u16),
-            Instruction::SLLIW { rd, rs, imm } => IshType::encode(0b0011011, 0b001, *rd, *rs, *imm, 0),
-            Instruction::SRLIW { rd, rs, imm } => IshType::encode(0b0011011, 0b101, *rd, *rs, *imm, 0),
-            Instruction::SRAIW { rd, rs, imm } => IshType::encode(0b0011011, 0b101, *rd, *rs, *imm, 0b0100000),
-            Instruction::JALR { rd, rs, offset } => IType::encode(0b1100111, 0b000, *rd, *rs, *offset as u16),
-            Instruction::ADD { rd, rs1, rs2 } => RType::encode(0b0110011, 0b000, 0b0000000, *rd, *rs1, *rs2),
-            Instruction::SUB { rd, rs1, rs2 } => RType::encode(0b0110011, 0b000, 0b0100000, *rd, *rs1, *rs2),
-            Instruction::SLL { rd, rs1, rs2 } => RType::encode(0b0110011, 0b001, 0b0000000, *rd, *rs1, *rs2),
-            Instruction::SLT { rd, rs1, rs2 } => RType::encode(0b0110011, 0b010, 0b0000000, *rd, *rs1, *rs2),
-            Instruction::SLTU { rd, rs1, rs2 } => RType::encode(0b0110011, 0b011, 0b0000000, *rd, *rs1, *rs2),
-            Instruction::XOR { rd, rs1, rs2 } => RType::encode(0b0110011, 0b100, 0b0000000, *rd, *rs1, *rs2),
-            Instruction::SRL { rd, rs1, rs2 } => RType::encode(0b0110011, 0b101, 0b0000000, *rd, *rs1, *rs2),
-            Instruction::SRA { rd, rs1, rs2 } => RType::encode(0b0110011, 0b101, 0b0100000, *rd, *rs1, *rs2),
-            Instruction::OR { rd, rs1, rs2 } => RType::encode(0b0110011, 0b110, 0b0000000, *rd, *rs1, *rs2),
-            Instruction::AND { rd, rs1, rs2 } => RType::encode(0b0110011, 0b111, 0b0000000, *rd, *rs1, *rs2),
-            Instruction::ADDW { rd, rs1, rs2 } => RType::encode(0b0111011, 0b000, 0b0000000, *rd, *rs1, *rs2),
-            Instruction::SUBW { rd, rs1, rs2 } => RType::encode(0b0111011, 0b000, 0b0100000, *rd, *rs1, *rs2),
-            Instruction::SLLW { rd, rs1, rs2 } => RType::encode(0b0111011, 0b001, 0b0000000, *rd, *rs1, *rs2),
-            Instruction::SRLW { rd, rs1, rs2 } => RType::encode(0b0111011, 0b101, 0b0000000, *rd, *rs1, *rs2),
-            Instruction::SRAW { rd, rs1, rs2 } => RType::encode(0b0111011, 0b101, 0b0100000, *rd, *rs1, *rs2),
-            Instruction::SB { rs2, offset, rs1 } => SType::encode(0b0100011, 0b000, *rs1, *rs2, *offset as u16),
-            Instruction::SH { offset, rs1, rs2 } => SType::encode(0b0100011, 0b001, *rs1, *rs2, *offset as u16),
-            Instruction::SW { offset, rs1, rs2 } => SType::encode(0b0100011, 0b010, *rs1, *rs2, *offset as u16),
-            Instruction::SD { offset, rs1, rs2 } => SType::encode(0b0100011, 0b011, *rs1, *rs2, *offset as u16),
-            Instruction::BEQ { rs1, rs2, offset } => SBType::encode(0b1100011, 0b000, *rs1, *rs2, *offset as u16),
-            Instruction::BNE { rs1, rs2, offset } => SBType::encode(0b1100011, 0b001, *rs1, *rs2, *offset as u16),
-            Instruction::BLT { rs1, rs2, offset } => SBType::encode(0b1100011, 0b100, *rs1, *rs2, *offset as u16),
-            Instruction::BGE { rs1, rs2, offset } => SBType::encode(0b1100011, 0b101, *rs1, *rs2, *offset as u16),
-            Instruction::BLTU { rs1, rs2, offset } => SBType::encode(0b1100011, 0b110, *rs1, *rs2, *offset as u16),
-            Instruction::BGEU { rs1, rs2, offset } => SBType::encode(0b1100011, 0b111, *rs1, *rs2, *offset as u16),
-            Instruction::AUIPC { rd, offset } => UType::encode(0b0010111, *rd, *offset),
-            Instruction::LUI { rd, imm } => UType::encode(0b0110111, *rd, *imm),
-            Instruction::JAL { rd, offset } => UJType::encode(0b1101111, *rd, *offset as u32),
-            Instruction::FENCE { pred, succ } => FenceType::encode(0b0001111, 0b000, *pred, *succ),
-            Instruction::FENCEI {} => IType::encode(0b0001111, 0b001,0,0,0),
-            Instruction::ECALL {} => IType::encode(0b1110011, 0b000,0,0,0),
-            Instruction::EBREAK {} => IType::encode(0b1110011, 0b000,0,0,1),
-            Instruction::CSRRW { rs, rd, csr } => IType::encode(0b1110011, 0b001, *rd, *rs, *csr),
-            Instruction::CSRRS { rs, rd, csr } => IType::encode(0b1110011, 0b010, *rd, *rs, *csr),
-            Instruction::CSRRC { rs, rd, csr } => IType::encode(0b1110011, 0b011, *rd, *rs, *csr),
-            Instruction::CSRRWI { zimm, rd, csr } => IType::encode(0b1110011, 0b101, *rd, *zimm, *csr),
-            Instruction::CSRRSI { zimm, rd, csr } => IType::encode(0b1110011, 0b110, *rd, *zimm, *csr),
-            Instruction::CSRRCI { zimm, rd, csr } => IType::encode(0b1110011, 0b111, *rd, *zimm, *csr),
-            Instruction::UNKNOWN { instruction } => *instruction,
+        use Instruction as I;
+        match *self {
+            I::LUI { rd, imm } => { debug_assert!(fits_upper(imm)); enc_u(OP_LUI, rd, imm) }
+            I::AUIPC { rd, imm } => { debug_assert!(fits_upper(imm)); enc_u(OP_AUIPC, rd, imm) }
+            I::JAL { rd, offset } => { debug_assert!(fits_jump(offset)); enc_j(OP_JAL, rd, offset) }
+            I::JALR { rd, rs1, offset } => { debug_assert!(fits(offset, 12)); enc_i(OP_JALR, 0b000, rd, rs1, offset) }
+
+            I::BEQ { rs1, rs2, offset } => { debug_assert!(fits_branch(offset)); enc_b(OP_BRANCH, 0b000, rs1, rs2, offset) }
+            I::BNE { rs1, rs2, offset } => { debug_assert!(fits_branch(offset)); enc_b(OP_BRANCH, 0b001, rs1, rs2, offset) }
+            I::BLT { rs1, rs2, offset } => { debug_assert!(fits_branch(offset)); enc_b(OP_BRANCH, 0b100, rs1, rs2, offset) }
+            I::BGE { rs1, rs2, offset } => { debug_assert!(fits_branch(offset)); enc_b(OP_BRANCH, 0b101, rs1, rs2, offset) }
+            I::BLTU { rs1, rs2, offset } => { debug_assert!(fits_branch(offset)); enc_b(OP_BRANCH, 0b110, rs1, rs2, offset) }
+            I::BGEU { rs1, rs2, offset } => { debug_assert!(fits_branch(offset)); enc_b(OP_BRANCH, 0b111, rs1, rs2, offset) }
+
+            I::LB { rd, rs1, offset } => { debug_assert!(fits(offset, 12)); enc_i(OP_LOAD, 0b000, rd, rs1, offset) }
+            I::LH { rd, rs1, offset } => { debug_assert!(fits(offset, 12)); enc_i(OP_LOAD, 0b001, rd, rs1, offset) }
+            I::LW { rd, rs1, offset } => { debug_assert!(fits(offset, 12)); enc_i(OP_LOAD, 0b010, rd, rs1, offset) }
+            I::LBU { rd, rs1, offset } => { debug_assert!(fits(offset, 12)); enc_i(OP_LOAD, 0b100, rd, rs1, offset) }
+            I::LHU { rd, rs1, offset } => { debug_assert!(fits(offset, 12)); enc_i(OP_LOAD, 0b101, rd, rs1, offset) }
+
+            I::SB { rs1, rs2, offset } => { debug_assert!(fits(offset, 12)); enc_s(OP_STORE, 0b000, rs1, rs2, offset) }
+            I::SH { rs1, rs2, offset } => { debug_assert!(fits(offset, 12)); enc_s(OP_STORE, 0b001, rs1, rs2, offset) }
+            I::SW { rs1, rs2, offset } => { debug_assert!(fits(offset, 12)); enc_s(OP_STORE, 0b010, rs1, rs2, offset) }
+
+            I::ADDI { rd, rs1, imm } => { debug_assert!(fits(imm, 12)); enc_i(OP_IMM, 0b000, rd, rs1, imm) }
+            I::SLTI { rd, rs1, imm } => { debug_assert!(fits(imm, 12)); enc_i(OP_IMM, 0b010, rd, rs1, imm) }
+            I::SLTIU { rd, rs1, imm } => { debug_assert!(fits(imm, 12)); enc_i(OP_IMM, 0b011, rd, rs1, imm) }
+            I::XORI { rd, rs1, imm } => { debug_assert!(fits(imm, 12)); enc_i(OP_IMM, 0b100, rd, rs1, imm) }
+            I::ORI { rd, rs1, imm } => { debug_assert!(fits(imm, 12)); enc_i(OP_IMM, 0b110, rd, rs1, imm) }
+            I::ANDI { rd, rs1, imm } => { debug_assert!(fits(imm, 12)); enc_i(OP_IMM, 0b111, rd, rs1, imm) }
+            I::SLLI { rd, rs1, shamt } => { debug_assert!(shamt < 32); enc_ish(OP_IMM, 0b001, 0, rd, rs1, shamt) }
+            I::SRLI { rd, rs1, shamt } => { debug_assert!(shamt < 32); enc_ish(OP_IMM, 0b101, 0, rd, rs1, shamt) }
+            I::SRAI { rd, rs1, shamt } => { debug_assert!(shamt < 32); enc_ish(OP_IMM, 0b101, ALT, rd, rs1, shamt) }
+
+            I::ADD { rd, rs1, rs2 } => enc_r(OP_REG, 0b000, 0, rd, rs1, rs2),
+            I::SUB { rd, rs1, rs2 } => enc_r(OP_REG, 0b000, ALT, rd, rs1, rs2),
+            I::SLL { rd, rs1, rs2 } => enc_r(OP_REG, 0b001, 0, rd, rs1, rs2),
+            I::SLT { rd, rs1, rs2 } => enc_r(OP_REG, 0b010, 0, rd, rs1, rs2),
+            I::SLTU { rd, rs1, rs2 } => enc_r(OP_REG, 0b011, 0, rd, rs1, rs2),
+            I::XOR { rd, rs1, rs2 } => enc_r(OP_REG, 0b100, 0, rd, rs1, rs2),
+            I::SRL { rd, rs1, rs2 } => enc_r(OP_REG, 0b101, 0, rd, rs1, rs2),
+            I::SRA { rd, rs1, rs2 } => enc_r(OP_REG, 0b101, ALT, rd, rs1, rs2),
+            I::OR { rd, rs1, rs2 } => enc_r(OP_REG, 0b110, 0, rd, rs1, rs2),
+            I::AND { rd, rs1, rs2 } => enc_r(OP_REG, 0b111, 0, rd, rs1, rs2),
+
+            I::MUL { rd, rs1, rs2 } => enc_r(OP_REG, 0b000, MULDIV, rd, rs1, rs2),
+            I::MULH { rd, rs1, rs2 } => enc_r(OP_REG, 0b001, MULDIV, rd, rs1, rs2),
+            I::MULHSU { rd, rs1, rs2 } => enc_r(OP_REG, 0b010, MULDIV, rd, rs1, rs2),
+            I::MULHU { rd, rs1, rs2 } => enc_r(OP_REG, 0b011, MULDIV, rd, rs1, rs2),
+            I::DIV { rd, rs1, rs2 } => enc_r(OP_REG, 0b100, MULDIV, rd, rs1, rs2),
+            I::DIVU { rd, rs1, rs2 } => enc_r(OP_REG, 0b101, MULDIV, rd, rs1, rs2),
+            I::REM { rd, rs1, rs2 } => enc_r(OP_REG, 0b110, MULDIV, rd, rs1, rs2),
+            I::REMU { rd, rs1, rs2 } => enc_r(OP_REG, 0b111, MULDIV, rd, rs1, rs2),
+
+            I::FENCE { pred, succ } => {
+                debug_assert!(pred < 16 && succ < 16);
+                ((pred as u32) << 24) | ((succ as u32) << 20) | OP_FENCE
+            }
+            I::FENCEI => (0b001 << 12) | OP_FENCE,
+            I::ECALL => enc_i(OP_SYSTEM, 0b000, 0, 0, 0),
+            I::EBREAK => enc_i(OP_SYSTEM, 0b000, 0, 0, 1),
+
+            I::CSRRW { rd, rs1, csr } => enc_i(OP_SYSTEM, 0b001, rd, rs1, i32::from(csr)),
+            I::CSRRS { rd, rs1, csr } => enc_i(OP_SYSTEM, 0b010, rd, rs1, i32::from(csr)),
+            I::CSRRC { rd, rs1, csr } => enc_i(OP_SYSTEM, 0b011, rd, rs1, i32::from(csr)),
+            I::CSRRWI { rd, zimm, csr } => { debug_assert!(zimm < 32); enc_i(OP_SYSTEM, 0b101, rd, zimm as Register, i32::from(csr)) }
+            I::CSRRSI { rd, zimm, csr } => { debug_assert!(zimm < 32); enc_i(OP_SYSTEM, 0b110, rd, zimm as Register, i32::from(csr)) }
+            I::CSRRCI { rd, zimm, csr } => { debug_assert!(zimm < 32); enc_i(OP_SYSTEM, 0b111, rd, zimm as Register, i32::from(csr)) }
+
+            I::UNKNOWN { word } => word,
         }
     }
+}
+
+/// Does `v` fit in a `bits`-wide two's complement field?
+const fn fits(v: i32, bits: u32) -> bool {
+    let min = -(1i64 << (bits - 1));
+    let max = (1i64 << (bits - 1)) - 1;
+    (v as i64) >= min && (v as i64) <= max
+}
+
+/// Branch displacements are 13-bit and always even.
+const fn fits_branch(v: i32) -> bool {
+    fits(v, 13) && v % 2 == 0
+}
+
+/// Jump displacements are 21-bit and always even.
+const fn fits_jump(v: i32) -> bool {
+    fits(v, 21) && v % 2 == 0
+}
+
+/// `LUI`/`AUIPC` carry a full value whose low 12 bits must be zero.
+const fn fits_upper(v: i32) -> bool {
+    v & 0xFFF == 0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use Instruction as I;
 
-    static INSTRUCTIONS: &[(u32, Instruction)] = &[
-        (0x00858503, Instruction::LB { rs: 11, rd: 10, offset: 8 }),
-        (0x00859503, Instruction::LH { rs: 11, rd: 10, offset: 8 }),
-        (0x0085a503, Instruction::LW { rs: 11, rd: 10, offset: 8 }),
-        (0x0085b503, Instruction::LD { rs: 11, rd: 10, offset: 8 }),
-        (0x0085c503, Instruction::LBU { rs: 11, rd: 10, offset: 8 }),
-        (0x0085d503, Instruction::LHU { rs: 11, rd: 10, offset: 8 }),
-        (0x0085e503, Instruction::LWU { rs: 11, rd: 10, offset: 8 }),
-        (0x01058513, Instruction::ADDI { rd: 10, rs: 11, imm: 16 }),
-        (0x01059513, Instruction::SLLI { rd: 10, rs: 11, imm: 16 }),
-        (0x0105a513, Instruction::SLTI { rd: 10, rs: 11, imm: 16 }),
-        (0x0105b513, Instruction::SLTIU { rd: 10, rs: 11, imm: 16 }),
-        (0x0105c513, Instruction::XORI { rd: 10, rs: 11, imm: 16 }),
-        (0x0105d513, Instruction::SRLI { rd: 10, rs: 11, imm: 16 }),
-        (0x4105d513, Instruction::SRAI { rd: 10, rs: 11, imm: 16 }),
-        (0x0105e513, Instruction::ORI { rd: 10, rs: 11, imm: 16 }),
-        (0x0105f513, Instruction::ANDI { rd: 10, rs: 11, imm: 16 }),
-        (0x00008517, Instruction::AUIPC { rd: 10, offset: 8 }),
-        (0x00010537, Instruction::LUI { rd: 10, imm: 16 }),
-        (0x0000056f, Instruction::JAL { rd: 10, offset: 0 }),
-        (0x0105851b, Instruction::ADDIW { rd: 10, rs: 11, imm: 16 }),
-        (0x0105951b, Instruction::SLLIW { rd: 10, rs: 11, imm: 16 }),
-        (0x0105d51b, Instruction::SRLIW { rd: 10, rs: 11, imm: 16 }),
-        (0x4105d51b, Instruction::SRAIW { rd: 10, rs: 11, imm: 16 }),
-        (0x00c58463, Instruction::BEQ { rs1: 11, rs2: 12, offset: 8 }),
-        (0x00c59463, Instruction::BNE { rs1: 11, rs2: 12, offset: 8 }),
-        (0x00c5c463, Instruction::BLT { rs1: 11, rs2: 12, offset: 8 }),
-        (0x00c5d463, Instruction::BGE { rs1: 11, rs2: 12, offset: 8 }),
-        (0x00c5e463, Instruction::BLTU { rs1: 11, rs2: 12, offset: 8 }),
-        (0x00c5f463, Instruction::BGEU { rs1: 11, rs2: 12, offset: 8 }),
-        (0x00c58423, Instruction::SB { rs1: 11, rs2: 12, offset: 8 }),
-        (0x00c59423, Instruction::SH { rs1: 11, rs2: 12, offset: 8 }),
-        (0x00c5a423, Instruction::SW { rs1: 11, rs2: 12, offset: 8 }),
-        (0x00c5b423, Instruction::SD { rs1: 11, rs2: 12, offset: 8 }),
-        (0x00c58533, Instruction::ADD { rd: 10, rs1: 11, rs2: 12 }),
-        (0x40c58533, Instruction::SUB { rd: 10, rs1: 11, rs2: 12 }),
-        (0x00c59533, Instruction::SLL { rd: 10, rs1: 11, rs2: 12 }),
-        (0x00c5a533, Instruction::SLT { rd: 10, rs1: 11, rs2: 12 }),
-        (0x00c5b533, Instruction::SLTU { rd: 10, rs1: 11, rs2: 12 }),
-        (0x00c5c533, Instruction::XOR { rd: 10, rs1: 11, rs2: 12 }),
-        (0x00c5d533, Instruction::SRL { rd: 10, rs1: 11, rs2: 12 }),
-        (0x40c5d533, Instruction::SRA { rd: 10, rs1: 11, rs2: 12 }),
-        (0x00c5e533, Instruction::OR { rd: 10, rs1: 11, rs2: 12 }),
-        (0x00c5f533, Instruction::AND { rd: 10, rs1: 11, rs2: 12 }),
-        (0x00c5853b, Instruction::ADDW { rd: 10, rs1: 11, rs2: 12 }),
-        (0x40c5853b, Instruction::SUBW { rd: 10, rs1: 11, rs2: 12 }),
-        (0x00c5953b, Instruction::SLLW { rd: 10, rs1: 11, rs2: 12 }),
-        (0x00c5d53b, Instruction::SRLW { rd: 10, rs1: 11, rs2: 12 }),
-        (0x40c5d53b, Instruction::SRAW { rd: 10, rs1: 11, rs2: 12 }),
-        (0x00858567, Instruction::JALR { rd: 10, rs: 11, offset: 8 }),
-        (0x0ff0000f, Instruction::FENCE { pred: 15, succ: 15 }),
-        (0x0000100f, Instruction::FENCEI {}),
-        (0x00000073, Instruction::ECALL {}),
-        (0x00100073, Instruction::EBREAK {}),
-        (0x00059573, Instruction::CSRRW { rs: 11, rd: 10, csr: 0 }),
-        (0x0015a573, Instruction::CSRRS { rs: 11, rd: 10, csr: 1 }),
-        (0x0025b573, Instruction::CSRRC { rs: 11, rd: 10, csr: 2 }),
-        (0x00385573, Instruction::CSRRWI { zimm: 16, rd: 10, csr: 3 }),
-        (0x00486573, Instruction::CSRRSI { zimm: 16, rd: 10, csr: 4 }),
-        (0x00587573, Instruction::CSRRCI { zimm: 16, rd: 10, csr: 5 }),
+    /// Reference encodings produced by
+    /// `llvm-mc -triple=riscv32 -mattr=+m -show-encoding`.
+    ///
+    /// Unlike the table this replaces, the immediates here sit on the
+    /// boundaries where sign extension actually matters.
+    #[rustfmt::skip]
+    static VECTORS: &[(u32, Instruction)] = &[
+        // Loads and stores, at both ends of the 12-bit range.
+        (0x00858503, I::LB   { rd: 10, rs1: 11, offset: 8 }),
+        (0x00859503, I::LH   { rd: 10, rs1: 11, offset: 8 }),
+        (0x0085a503, I::LW   { rd: 10, rs1: 11, offset: 8 }),
+        (0x0085c503, I::LBU  { rd: 10, rs1: 11, offset: 8 }),
+        (0x0085d503, I::LHU  { rd: 10, rs1: 11, offset: 8 }),
+        (0x8005a503, I::LW   { rd: 10, rs1: 11, offset: -2048 }),
+        (0x7ff5a503, I::LW   { rd: 10, rs1: 11, offset: 2047 }),
+        (0x00a58423, I::SB   { rs1: 11, rs2: 10, offset: 8 }),
+        (0x00a59423, I::SH   { rs1: 11, rs2: 10, offset: 8 }),
+        (0x00a5a423, I::SW   { rs1: 11, rs2: 10, offset: 8 }),
+        (0x06a5a223, I::SW   { rs1: 11, rs2: 10, offset: 100 }),
+        (0x80a5a023, I::SW   { rs1: 11, rs2: 10, offset: -2048 }),
+        (0x7ea5afa3, I::SW   { rs1: 11, rs2: 10, offset: 2047 }),
+
+        // Register-immediate, including the values the old decoder got wrong.
+        (0x01058513, I::ADDI { rd: 10, rs1: 11, imm: 16 }),
+        (0x7ff58513, I::ADDI { rd: 10, rs1: 11, imm: 2047 }),
+        (0x80058513, I::ADDI { rd: 10, rs1: 11, imm: -2048 }),
+        (0x40058513, I::ADDI { rd: 10, rs1: 11, imm: 1024 }),
+        (0xfff58513, I::ADDI { rd: 10, rs1: 11, imm: -1 }),
+        (0x8005a513, I::SLTI { rd: 10, rs1: 11, imm: -2048 }),
+        (0xfff5b513, I::SLTIU{ rd: 10, rs1: 11, imm: -1 }),
+        (0xfff5c513, I::XORI { rd: 10, rs1: 11, imm: -1 }),
+        (0xf005e513, I::ORI  { rd: 10, rs1: 11, imm: -256 }),
+        (0xfff5f513, I::ANDI { rd: 10, rs1: 11, imm: -1 }),
+        (0x01059513, I::SLLI { rd: 10, rs1: 11, shamt: 16 }),
+        (0x01f59513, I::SLLI { rd: 10, rs1: 11, shamt: 31 }),
+        (0x0105d513, I::SRLI { rd: 10, rs1: 11, shamt: 16 }),
+        (0x4105d513, I::SRAI { rd: 10, rs1: 11, shamt: 16 }),
+
+        // Upper immediates carry the full value.
+        (0x00010537, I::LUI  { rd: 10, imm: 0x10000 }),
+        (0x80000537, I::LUI  { rd: 10, imm: -0x8000_0000 }),
+        (0xfffff537, I::LUI  { rd: 10, imm: -0x1000 }),
+        (0x00008517, I::AUIPC{ rd: 10, imm: 0x8000 }),
+        (0xfffff517, I::AUIPC{ rd: 10, imm: -0x1000 }),
+
+        // Register-register.
+        (0x00c58533, I::ADD  { rd: 10, rs1: 11, rs2: 12 }),
+        (0x40c58533, I::SUB  { rd: 10, rs1: 11, rs2: 12 }),
+        (0x00c59533, I::SLL  { rd: 10, rs1: 11, rs2: 12 }),
+        (0x00c5a533, I::SLT  { rd: 10, rs1: 11, rs2: 12 }),
+        (0x00c5b533, I::SLTU { rd: 10, rs1: 11, rs2: 12 }),
+        (0x00c5c533, I::XOR  { rd: 10, rs1: 11, rs2: 12 }),
+        (0x00c5d533, I::SRL  { rd: 10, rs1: 11, rs2: 12 }),
+        (0x40c5d533, I::SRA  { rd: 10, rs1: 11, rs2: 12 }),
+        (0x00c5e533, I::OR   { rd: 10, rs1: 11, rs2: 12 }),
+        (0x00c5f533, I::AND  { rd: 10, rs1: 11, rs2: 12 }),
+
+        // RV32M.
+        (0x02c58533, I::MUL   { rd: 10, rs1: 11, rs2: 12 }),
+        (0x02c59533, I::MULH  { rd: 10, rs1: 11, rs2: 12 }),
+        (0x02c5a533, I::MULHSU{ rd: 10, rs1: 11, rs2: 12 }),
+        (0x02c5b533, I::MULHU { rd: 10, rs1: 11, rs2: 12 }),
+        (0x02c5c533, I::DIV   { rd: 10, rs1: 11, rs2: 12 }),
+        (0x02c5d533, I::DIVU  { rd: 10, rs1: 11, rs2: 12 }),
+        (0x02c5e533, I::REM   { rd: 10, rs1: 11, rs2: 12 }),
+        (0x02c5f533, I::REMU  { rd: 10, rs1: 11, rs2: 12 }),
+
+        // Control transfer, at the extremes of each displacement.
+        (0x00b50463, I::BEQ  { rs1: 10, rs2: 11, offset: 8 }),
+        (0xfeb50ce3, I::BEQ  { rs1: 10, rs2: 11, offset: -8 }),
+        (0x00b500e3, I::BEQ  { rs1: 10, rs2: 11, offset: 2048 }),
+        (0x7eb50fe3, I::BEQ  { rs1: 10, rs2: 11, offset: 4094 }),
+        (0x80b50063, I::BEQ  { rs1: 10, rs2: 11, offset: -4096 }),
+        (0x06b51263, I::BNE  { rs1: 10, rs2: 11, offset: 100 }),
+        (0x00b54463, I::BLT  { rs1: 10, rs2: 11, offset: 8 }),
+        (0x00b55463, I::BGE  { rs1: 10, rs2: 11, offset: 8 }),
+        (0x00b56463, I::BLTU { rs1: 10, rs2: 11, offset: 8 }),
+        (0x00b57463, I::BGEU { rs1: 10, rs2: 11, offset: 8 }),
+        (0x0080056f, I::JAL  { rd: 10, offset: 8 }),
+        (0xff9ff56f, I::JAL  { rd: 10, offset: -8 }),
+        (0x7ffff56f, I::JAL  { rd: 10, offset: 1048574 }),
+        (0x8000056f, I::JAL  { rd: 10, offset: -1048576 }),
+        (0x00858567, I::JALR { rd: 10, rs1: 11, offset: 8 }),
+        (0x80058567, I::JALR { rd: 10, rs1: 11, offset: -2048 }),
+
+        // System.
+        (0x0ff0000f, I::FENCE { pred: 15, succ: 15 }),
+        (0x0000100f, I::FENCEI),
+        (0x00000073, I::ECALL),
+        (0x00100073, I::EBREAK),
+        (0x00059573, I::CSRRW { rd: 10, rs1: 11, csr: 0 }),
+        (0x0015a573, I::CSRRS { rd: 10, rs1: 11, csr: 1 }),
+        (0x0025b573, I::CSRRC { rd: 10, rs1: 11, csr: 2 }),
+        (0x0038d573, I::CSRRWI{ rd: 10, zimm: 17, csr: 3 }),
+        (0x0048e573, I::CSRRSI{ rd: 10, zimm: 17, csr: 4 }),
+        (0x0058f573, I::CSRRCI{ rd: 10, zimm: 17, csr: 5 }),
     ];
 
     #[test]
-    fn decode() {
-        for (x, i) in INSTRUCTIONS {
-            assert_eq!(&Instruction::decode(*x), i, "decode {:?}", i);
+    fn decodes_reference_encodings() {
+        for (word, want) in VECTORS {
+            assert_eq!(&Instruction::decode(*word), want, "decoding {word:#010x}");
         }
     }
+
     #[test]
-    fn encode() {
-        for (x, i) in INSTRUCTIONS {
-            assert_eq!(&i.encode(), x, "encode {:?}", i);
+    fn encodes_reference_encodings() {
+        for (word, instruction) in VECTORS {
+            assert_eq!(instruction.encode(), *word, "encoding {instruction:?}");
         }
+    }
+
+    /// The property the old table-only tests could not express: for every word
+    /// the decoder claims to understand, encoding the result must reproduce it
+    /// exactly. This is what catches a getter and its setter drifting apart.
+    #[test]
+    fn decode_and_encode_round_trip() {
+        // xorshift32, so the corpus is reproducible without a dependency.
+        let mut state: u32 = 0x1234_5678;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+
+        let mut recognised = 0u32;
+        for _ in 0..2_000_000 {
+            let word = next();
+            let decoded = Instruction::decode(word);
+            if let Instruction::UNKNOWN { .. } = decoded {
+                continue;
+            }
+            recognised += 1;
+            assert_eq!(decoded.encode(), word, "round trip failed for {word:#010x} -> {decoded:?}");
+        }
+        // Sanity: the corpus actually exercised the decoder.
+        assert!(recognised > 50_000, "only {recognised} words were recognised");
+    }
+
+    /// Walk every opcode/funct3/funct7 combination rather than sampling, so no
+    /// recognised encoding escapes the round-trip property.
+    #[test]
+    fn round_trip_is_exhaustive_over_the_encoding_space() {
+        for opcode in 0u32..128 {
+            for funct3 in 0u32..8 {
+                for funct7 in 0u32..128 {
+                    // Fill the register and immediate fields with a pattern
+                    // that is not all-zero, so field placement bugs show up.
+                    let word = (funct7 << 25)
+                        | (0b10110 << 20)
+                        | (0b01101 << 15)
+                        | (funct3 << 12)
+                        | (0b11010 << 7)
+                        | opcode;
+                    let decoded = Instruction::decode(word);
+                    if let Instruction::UNKNOWN { .. } = decoded {
+                        continue;
+                    }
+                    assert_eq!(decoded.encode(), word, "{word:#010x} -> {decoded:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_encodings_survive_a_round_trip_unchanged() {
+        // 0b1111111 is not an RV32 opcode.
+        let word = 0xDEAD_BE7F;
+        assert_eq!(Instruction::decode(word), I::UNKNOWN { word });
+        assert_eq!(I::UNKNOWN { word }.encode(), word);
+    }
+
+    #[test]
+    fn rv64_only_encodings_are_rejected() {
+        // LD, LWU, SD, ADDIW, ADDW: valid on RV64, illegal here.
+        for word in [0x0085b503u32, 0x0085e503, 0x00c5b423, 0x0105851b, 0x00c5853b] {
+            assert!(
+                matches!(Instruction::decode(word), I::UNKNOWN { .. }),
+                "{word:#010x} should not decode on RV32"
+            );
+        }
+        // On RV32 a shift amount only has 5 bits; bit 25 set is not an encoding.
+        assert!(matches!(Instruction::decode(0x02059513), I::UNKNOWN { .. }));
+    }
+
+    #[test]
+    fn sign_extension_is_width_correct() {
+        assert_eq!(sext(0b0111, 4), 7);
+        assert_eq!(sext(0b1000, 4), -8);
+        assert_eq!(sext(0xFFF, 12), -1);
+        assert_eq!(sext(0x7FF, 12), 2047);
+        assert_eq!(sext(0x800, 12), -2048);
+        assert_eq!(sext(0x1FFF, 13), -1);
+        assert_eq!(sext(0x0FFF, 13), 4095);
+        assert_eq!(sext(0x1F_FFFF, 21), -1);
+        assert_eq!(sext(0x0F_FFFF, 21), 1048575);
     }
 }

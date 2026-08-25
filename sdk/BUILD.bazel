@@ -1,0 +1,34 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# The console SDK. Guest code only: it contains the reset vector and a panic
+# handler, so it is built for //platforms:rv32 and nothing else.
+rust_library(
+    name = "console",
+    srcs = [
+        "audio.rs",
+        "fixed.rs",
+        "gfx.rs",
+        "input.rs",
+        "midi.rs",
+        "loader.rs",
+        "lib.rs",
+        "sys.rs",
+        "video.rs",
+    ],
+    crate_name = "console",
+    edition = "2024",
+    rustc_flags = [
+        "-Ctarget-feature=-c",
+        "-Copt-level=2",
+    ],
+    target_compatible_with = [
+        "@platforms//cpu:riscv32",
+        "@platforms//os:none",
+    ],
+)
+
+# The memory layout every cartridge links against. Must agree with ROM_SIZE and
+# RAM_SIZE in sgsae/console.rs.
+exports_files(["console.ld"])

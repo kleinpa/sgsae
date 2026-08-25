@@ -1,8 +1,10 @@
+load("@aspect_rules_js//js:defs.bzl", "js_test")
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("@npm//:defs.bzl", "npm_link_all_packages")
 load("@npm//ui:vite/package_json.bzl", vite_bin = "bin")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_shared_library")
-load("@rules_rust//wasm_bindgen:defs.bzl", "rust_wasm_bindgen")
+load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen")
 
 npm_link_all_packages(name = "node_modules")
 
@@ -11,10 +13,12 @@ package(default_visibility = ["//visibility:public"])
 rust_shared_library(
     name = "app",
     srcs = ["app.rs"],
-    edition = "2018",
+    edition = "2021",
+    # See //sgsae: the emulator has to be optimised to keep up with real time.
+    rustc_flags = ["-Copt-level=2"],
     deps = [
         "//sgsae",
-        "@rules_rust//wasm_bindgen/3rdparty:wasm_bindgen",
+        "@rules_rust_wasm_bindgen//3rdparty:wasm_bindgen",
     ],
 )
 
@@ -24,10 +28,41 @@ rust_wasm_bindgen(
     wasm_file = ":app",
 )
 
+# Cartridges go into vite's public directory, which it copies to the site root
+# verbatim. That keeps their names stable — a guest hardcodes "/lander.elf", so
+# a content hash in the filename would break every link.
+[copy_file(
+    name = name + "_elf",
+    src = "//game:" + name,
+    out = "public/system/" + name + ".elf",
+    # Without this, copy_file shells out to `cp`.
+    allow_symlink = True,
+) for name in [
+    "io",
+    "lander",
+    "loader",
+    "seq",
+]]
+
+filegroup(
+    name = "cartridges",
+    srcs = [
+        ":io_elf",
+        ":lander_elf",
+        ":loader_elf",
+        ":seq_elf",
+    ],
+)
+
 SRCS = [
     "main.js",
+    "render.js",
+    "input.js",
+    "midi.js",
     "index.html",
+    "vite.config.mjs",
     ":app_bindgen",
+    ":cartridges",
 ]
 
 BUILD_DEPS = [
@@ -52,5 +87,25 @@ build_test(
     name = "build_test",
     targets = [
         ":build",
+    ],
+)
+
+# Loads the built page in a real browser and checks the emulator runs.
+#
+# The dev container installs Chrome for Testing and a version-matched
+# chromedriver, and .bazelrc forwards CHROME_BIN / CHROMEDRIVER_BIN into the
+# sandbox to point at them. Without those, selenium locates a browser itself and
+# fetches a driver on first run, which needs the network.
+js_test(
+    name = "e2e_test",
+    chdir = package_name(),
+    data = [
+        ":build",
+        ":node_modules/selenium-webdriver",
+    ],
+    entry_point = "e2e_test.js",
+    tags = [
+        "external",
+        "requires-network",
     ],
 )
